@@ -51,7 +51,7 @@ def seed_prompts() -> None:
         print(f"  {agent_id} v1 → {tokens} tokens (id={pv_id}) ACTIVE")
 
     # personas
-    for persona in ["cooperative"]:  # day 1: just cooperative; rest on day 2
+    for persona in ["cooperative", "combative", "evasive", "confused", "distressed"]:
         p = PROMPTS / "simulator" / f"{persona}_v1.md"
         if not p.exists():
             continue
