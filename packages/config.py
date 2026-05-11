@@ -40,6 +40,9 @@ class Settings(BaseSettings):
     # Reproducibility
     rng_seed: int = Field(default=20260512, alias="RNG_SEED")
 
+    # Borrower side: "sim" (LLM) or "human" (CLI). See .env.example.
+    borrower_mode: str = Field(default="sim", alias="BORROWER_MODE")
+
     @property
     def postgres_dsn(self) -> str:
         return (

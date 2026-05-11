@@ -1,4 +1,4 @@
-.PHONY: fresh-start up down seed test smoke worker api logs clean
+.PHONY: fresh-start up down seed test smoke chat chat-sim worker api logs clean costs
 
 # Boot everything from cold (target: <5 min, FINAL_PLAN §13)
 fresh-start: up seed test
@@ -21,6 +21,16 @@ test:
 
 smoke:
 	uv run python scripts/smoke_test.py
+
+# Interactive: YOU play the borrower. Walks through A1 -> A2 -> A3.
+#   make chat                    -> cooperative profile
+#   make chat PERSONA=distressed -> distressed profile (tests hardship rule)
+chat:
+	uv run python scripts/chat.py --mode human --persona $(or $(PERSONA),cooperative)
+
+# Autoplay: LLM-borrower against the agents (visible alternative to make smoke).
+chat-sim:
+	uv run python scripts/chat.py --mode sim --persona $(or $(PERSONA),cooperative)
 
 worker:
 	uv run python -m apps.workflow.worker
