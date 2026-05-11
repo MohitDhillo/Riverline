@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "notes": "Settlement-policy ranges. Used by compliance rule 4 (no misleading terms) to validate offers presented by Agent 2.",
+  "lump_sum_discount_pct": {
+    "min": 25,
+    "max": 35,
+    "default": 30
+  },
+  "structured_plan_months": {
+    "min": 6,
+    "max": 24,
+    "default": 12
+  },
+  "structured_plan_monthly_amount_usd": {
+    "min": 100,
+    "max": 600,
+    "cap_pct_of_stated_income": 60
+  },
+  "documented_next_steps": [
+    "credit_bureau_reporting",
+    "legal_review_referral",
+    "asset_recovery_per_loan_terms"
+  ],
+  "prohibited_threats": [
+    "wage_garnishment_without_court_order",
+    "arrest",
+    "criminal_prosecution",
+    "social_security_revocation",
+    "deportation",
+    "publication_of_debt"
+  ]
+}

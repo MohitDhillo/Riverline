@@ -71,7 +71,7 @@ class Conversation(Base):
     started_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     ended_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     iteration_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    persona: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    persona: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
     agent_versions: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
     outcome: Mapped[Optional[str]] = mapped_column(String(60), nullable=True)
 
