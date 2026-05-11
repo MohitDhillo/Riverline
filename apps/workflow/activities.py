@@ -1,23 +1,24 @@
-"""Temporal activities.
-
-Activities are the *only* place LLM/network/db calls live. Workflows must be
-deterministic — they cannot call LLMs, read the clock, or generate randomness
-outside `workflow.now()` / `workflow.random()`.
-
-Day 1: just the chat-agent activity. Day 2 adds the voice activity and summarizer.
-"""
+"""Temporal activities for the collections pipeline."""
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
 from typing import Optional
 
 from temporalio import activity
 
 from packages.agents.agent_1 import AssessmentAgent
+from packages.agents.agent_2 import ResolutionAgent
+from packages.agents.agent_3 import FinalNoticeAgent
 from packages.simulator.borrower import BorrowerSimulator, load_borrowers
 from packages.simulator.runner import run_chat_conversation
-from packages.storage.repos import install_cost_persistence
+from packages.storage.repos import (
+    install_cost_persistence,
+    load_turns,
+    record_handoff,
+)
+from packages.summarizer import summarize_for_handoff
 
 
 @dataclass
@@ -37,20 +38,29 @@ class ChatAgentOutput:
     transcript: list[dict]
 
 
+@dataclass
+class SummarizeInput:
+    conversation_ids: list[str]   # in order; second one is the latest stage
+    to_agent: str                  # 'to_agent_2' | 'to_agent_3'
+    iteration_id: Optional[int] = None
+
+
+@dataclass
+class SummarizeOutput:
+    payload_json: str
+    payload_tokens: int
+    trimmed_fields: dict
+
+
 _AGENT_CLASSES = {
     "agent_1": AssessmentAgent,
-    # agent_3 added Day 2
+    "agent_2": ResolutionAgent,
+    "agent_3": FinalNoticeAgent,
 }
 
 
 @activity.defn
 async def run_chat_agent(inp: ChatAgentInput) -> ChatAgentOutput:
-    """Drive a full chat between the named agent and a simulated borrower.
-
-    Day 1 uses the simulator as the borrower for end-to-end testing. The
-    production path (Day 2+) will instead consume real user messages via
-    Temporal signals.
-    """
     install_cost_persistence()
     activity.heartbeat()
 
@@ -58,7 +68,6 @@ async def run_chat_agent(inp: ChatAgentInput) -> ChatAgentOutput:
     if agent_cls is None:
         raise RuntimeError(f"unknown agent_id: {inp.agent_id}")
 
-    # Pick the borrower from the seeded fixtures.
     candidates = [b for b in load_borrowers() if b.id == inp.borrower_id]
     if not candidates:
         raise RuntimeError(f"borrower {inp.borrower_id} not found in seeds")
@@ -66,7 +75,6 @@ async def run_chat_agent(inp: ChatAgentInput) -> ChatAgentOutput:
 
     agent = agent_cls()
     sim = BorrowerSimulator(profile)
-
     conv_id, result = run_chat_conversation(
         agent,
         sim,
@@ -75,10 +83,43 @@ async def run_chat_agent(inp: ChatAgentInput) -> ChatAgentOutput:
         workflow_id=activity.info().workflow_id,
         iteration_id=inp.iteration_id,
     )
-
     return ChatAgentOutput(
         conversation_id=str(conv_id),
         outcome=result.outcome,
         turns=result.turns,
         transcript=result.transcript,
+    )
+
+
+@activity.defn
+async def summarize_handoff(inp: SummarizeInput) -> SummarizeOutput:
+    install_cost_persistence()
+    activity.heartbeat()
+
+    # combine turns across all listed conversations, in order
+    combined: list[dict] = []
+    for cid in inp.conversation_ids:
+        combined.extend(load_turns(uuid.UUID(cid)))
+
+    target_conv = uuid.UUID(inp.conversation_ids[-1])
+    res = summarize_for_handoff(
+        combined,
+        to_agent=inp.to_agent,
+        conversation_id=str(target_conv),
+        iteration_id=inp.iteration_id,
+    )
+
+    payload_json = res.payload.to_compact_json()
+    record_handoff(
+        conversation_id=target_conv,
+        from_agent=combined[-1].get("agent_id", "unknown") if combined else "unknown",
+        to_agent=inp.to_agent,
+        payload=res.payload.model_dump(),
+        payload_tokens=res.payload_tokens,
+        trimmed_fields=res.trimmed_fields or None,
+    )
+    return SummarizeOutput(
+        payload_json=payload_json,
+        payload_tokens=res.payload_tokens,
+        trimmed_fields=res.trimmed_fields,
     )

@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from temporalio.client import Client
 from temporalio.worker import Worker
 
-from apps.workflow.activities import run_chat_agent
+from apps.workflow.activities import run_chat_agent, summarize_handoff
 from apps.workflow.collections import CollectionsWorkflow
 from packages.config import settings
 
@@ -27,7 +27,7 @@ async def main() -> None:
         client,
         task_queue=s.temporal_task_queue,
         workflows=[CollectionsWorkflow],
-        activities=[run_chat_agent],
+        activities=[run_chat_agent, summarize_handoff],
         activity_executor=activity_executor,
     ):
         logging.info(f"worker listening on task queue '{s.temporal_task_queue}'")

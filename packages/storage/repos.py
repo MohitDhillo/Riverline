@@ -1,8 +1,4 @@
-"""Thin repository helpers around the SQLAlchemy models.
-
-Day 1 uses just enough of these for the smoke test (prompt fetch, turn insert,
-cost-ledger persistence). More repos added as we wire the rest of the stack.
-"""
+"""Thin repository helpers around the SQLAlchemy models."""
 
 from __future__ import annotations
 
@@ -18,6 +14,7 @@ from packages.storage.models import (
     ActivePrompt,
     Conversation,
     CostLedgerEntry,
+    Handoff,
     PromptVersion,
     Turn,
 )
@@ -31,7 +28,6 @@ def get_active_prompt(agent_id: str) -> PromptVersion:
         if not ap:
             raise RuntimeError(f"no active prompt for {agent_id} — run seed_db.py first")
         pv = s.get(PromptVersion, ap.version_id)
-        # detach so caller can use after session close
         s.expunge(pv)
         return pv
 
@@ -123,12 +119,46 @@ def add_turn(
         ))
 
 
+def load_turns(conversation_id: uuid.UUID) -> list[dict]:
+    """Return [{agent_id, role, content, seq}] in order."""
+    with session_scope() as s:
+        rows = s.execute(
+            select(Turn).where(Turn.conversation_id == conversation_id).order_by(Turn.seq)
+        ).scalars().all()
+        return [
+            {"agent_id": t.agent_id, "role": t.role, "content": t.content, "seq": t.seq}
+            for t in rows
+        ]
+
+
 def end_conversation(conversation_id: uuid.UUID, outcome: str) -> None:
     with session_scope() as s:
         c = s.get(Conversation, conversation_id)
         if c:
             c.ended_at = datetime.utcnow()
             c.outcome = outcome
+
+
+def record_handoff(
+    conversation_id: uuid.UUID,
+    from_agent: str,
+    to_agent: str,
+    payload: dict,
+    payload_tokens: int,
+    trimmed_fields: Optional[dict] = None,
+) -> int:
+    with session_scope() as s:
+        h = Handoff(
+            conversation_id=conversation_id,
+            from_agent=from_agent,
+            to_agent=to_agent,
+            payload=payload,
+            payload_tokens=payload_tokens,
+            trimmed_fields=trimmed_fields,
+        )
+        s.add(h)
+        s.flush()
+        return h.id
 
 
 def persist_cost_record(rec: CostRecord) -> None:
@@ -149,5 +179,4 @@ def persist_cost_record(rec: CostRecord) -> None:
 
 
 def install_cost_persistence() -> None:
-    """Wire BudgetTracker → Postgres. Call once at process boot."""
     budget().install_persist_hook(persist_cost_record)

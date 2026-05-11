@@ -1,14 +1,11 @@
-"""CollectionsWorkflow — one workflow per borrower.
-
-Day 1: Assessment only. Day 2 adds the rest of the pipeline:
-  Assessment → Summarizer → Resolution → Summarizer → Final Notice.
-"""
+"""CollectionsWorkflow — full A1 → A2 → A3 pipeline with summarizers between stages."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 from enum import Enum
+from typing import Optional
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
@@ -17,39 +14,53 @@ with workflow.unsafe.imports_passed_through():
     from apps.workflow.activities import (
         ChatAgentInput,
         ChatAgentOutput,
+        SummarizeInput,
+        SummarizeOutput,
         run_chat_agent,
+        summarize_handoff,
     )
 
 
 class Outcome(str, Enum):
-    ASSESSED = "assessed"
-    PARTIAL = "partial"
-    NO_RESPONSE = "no_response"
     RESOLVED_AT_RESOLUTION = "resolved_at_resolution"
     RESOLVED_AT_FINAL = "resolved_at_final"
     UNRESOLVED = "unresolved"
+    OPT_OUT = "opt_out"
 
 
 @dataclass
 class CollectionsInput:
     borrower_id: str
-    iteration_id: int | None = None
+    iteration_id: Optional[int] = None
+    # If true, stop after Agent 1 (D1-style). Useful for unit testing in workflow form.
+    assess_only: bool = False
 
 
 @dataclass
 class CollectionsOutput:
     outcome: str
-    assessment_conversation_id: str
-    transcript_excerpt: str
+    assessment_conversation_id: Optional[str] = None
+    resolution_conversation_id: Optional[str] = None
+    final_conversation_id: Optional[str] = None
+    handoff_1_to_2_tokens: int = 0
+    handoff_2_to_3_tokens: int = 0
+    summary: str = ""
+    excerpts: dict = field(default_factory=dict)
+
+
+def _excerpt(turns: list[dict], n: int = 6) -> str:
+    return "\n".join(f"[{t['role']}] {t['content'][:120]}" for t in turns[:n])
 
 
 @workflow.defn
 class CollectionsWorkflow:
     @workflow.run
     async def run(self, inp: CollectionsInput) -> CollectionsOutput:
+        out = CollectionsOutput(outcome=Outcome.UNRESOLVED)
+
         # ---- ASSESSMENT ----
-        # Day 1: a single attempt. Day 2 brings the 3-retry loop.
-        assess: ChatAgentOutput = await workflow.execute_activity(
+        # Day 2: single attempt. 3-retry loop comes later when we add signal-driven chat.
+        t1: ChatAgentOutput = await workflow.execute_activity(
             run_chat_agent,
             ChatAgentInput(
                 borrower_id=inp.borrower_id,
@@ -62,13 +73,86 @@ class CollectionsWorkflow:
             heartbeat_timeout=timedelta(minutes=2),
             retry_policy=RetryPolicy(maximum_attempts=1),
         )
+        out.assessment_conversation_id = t1.conversation_id
+        out.excerpts["agent_1"] = _excerpt(t1.transcript)
+        if t1.outcome == "opt_out":
+            out.outcome = Outcome.OPT_OUT
+            return out
+        if inp.assess_only:
+            out.summary = f"assess_only=True; outcome={t1.outcome}"
+            return out
 
-        excerpt = "\n".join(
-            f"[{t['role']}] {t['content'][:120]}"
-            for t in assess.transcript[:6]
+        # ---- Handoff 1→2 ----
+        h2: SummarizeOutput = await workflow.execute_activity(
+            summarize_handoff,
+            SummarizeInput(
+                conversation_ids=[t1.conversation_id],
+                to_agent="to_agent_2",
+                iteration_id=inp.iteration_id,
+            ),
+            start_to_close_timeout=timedelta(minutes=3),
+            heartbeat_timeout=timedelta(minutes=1),
+            retry_policy=RetryPolicy(maximum_attempts=2),
         )
-        return CollectionsOutput(
-            outcome=assess.outcome,
-            assessment_conversation_id=assess.conversation_id,
-            transcript_excerpt=excerpt,
+        out.handoff_1_to_2_tokens = h2.payload_tokens
+
+        # ---- RESOLUTION (text-mode for Day 2; Vapi swap-in on Day 5) ----
+        t2: ChatAgentOutput = await workflow.execute_activity(
+            run_chat_agent,
+            ChatAgentInput(
+                borrower_id=inp.borrower_id,
+                agent_id="agent_2",
+                handoff=h2.payload_json,
+                iteration_id=inp.iteration_id,
+                max_turns=12,
+            ),
+            start_to_close_timeout=timedelta(minutes=10),
+            heartbeat_timeout=timedelta(minutes=2),
+            retry_policy=RetryPolicy(maximum_attempts=1),
         )
+        out.resolution_conversation_id = t2.conversation_id
+        out.excerpts["agent_2"] = _excerpt(t2.transcript)
+        if t2.outcome == "deal_agreed":
+            out.outcome = Outcome.RESOLVED_AT_RESOLUTION
+            return out
+        if t2.outcome == "opt_out":
+            out.outcome = Outcome.OPT_OUT
+            return out
+
+        # ---- Handoff 2→3 (full history, both stages) ----
+        h3: SummarizeOutput = await workflow.execute_activity(
+            summarize_handoff,
+            SummarizeInput(
+                conversation_ids=[t1.conversation_id, t2.conversation_id],
+                to_agent="to_agent_3",
+                iteration_id=inp.iteration_id,
+            ),
+            start_to_close_timeout=timedelta(minutes=3),
+            heartbeat_timeout=timedelta(minutes=1),
+            retry_policy=RetryPolicy(maximum_attempts=2),
+        )
+        out.handoff_2_to_3_tokens = h3.payload_tokens
+
+        # ---- FINAL NOTICE ----
+        t3: ChatAgentOutput = await workflow.execute_activity(
+            run_chat_agent,
+            ChatAgentInput(
+                borrower_id=inp.borrower_id,
+                agent_id="agent_3",
+                handoff=h3.payload_json,
+                iteration_id=inp.iteration_id,
+                max_turns=10,
+            ),
+            start_to_close_timeout=timedelta(minutes=10),
+            heartbeat_timeout=timedelta(minutes=2),
+            retry_policy=RetryPolicy(maximum_attempts=1),
+        )
+        out.final_conversation_id = t3.conversation_id
+        out.excerpts["agent_3"] = _excerpt(t3.transcript)
+        if t3.outcome == "resolved":
+            out.outcome = Outcome.RESOLVED_AT_FINAL
+        elif t3.outcome == "opt_out":
+            out.outcome = Outcome.OPT_OUT
+        else:
+            out.outcome = Outcome.UNRESOLVED
+        return out
