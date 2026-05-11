@@ -1,51 +1,28 @@
-"""Agent 1 — Assessment (chat).
-
-Goal: verify identity, capture debt acknowledgement, capture financial situation.
-Outcome states: 'assessed' | 'partial' | 'no_response'.
-
-Outcome classification on Day 1 is a lightweight heuristic on transcript content.
-On Day 2 we move to tool-call-based outcomes (verify_identity + record_disclosure
-return structured records that drive classification deterministically).
-"""
+"""Agent 1 — Assessment (chat). Outcome driven by tool calls."""
 
 from __future__ import annotations
 
-import re
-
 from packages.agents.base import BaseAgent
+from packages.agents.tools import AGENT_1_TOOLS
 
 
 class AssessmentAgent(BaseAgent):
     agent_id = "agent_1"
-    max_tokens_out = 320  # short turns
+    max_tokens_out = 384
+    tools = AGENT_1_TOOLS
 
-    def classify_outcome(self, transcript: list[dict]) -> str:
-        if not transcript:
-            return "no_response"
+    def classify_outcome(self, transcript: list[dict], tool_calls: list[dict]) -> str:
+        names = {tc["name"] for tc in tool_calls}
+        if "flag_opt_out" in names:
+            return "opt_out"
 
-        borrower_turns = [t for t in transcript if t["role"] == "user"]
-        agent_turns = [t for t in transcript if t["role"] == "assistant"]
-        if not borrower_turns:
-            return "no_response"
-
-        joined_borrower = " ".join(t["content"].lower() for t in borrower_turns)
-        joined_agent = " ".join(t["content"].lower() for t in agent_turns)
-
-        # crude signals — replaced by tool calls in Day 2
-        identity_signal = (
-            re.search(r"\b\d{4}\b", joined_borrower) is not None
-            and ("dob" in joined_borrower or re.search(r"\b(19|20)\d{2}\b", joined_borrower))
-        )
-        income_signal = any(w in joined_borrower for w in [
-            "income", "salary", "wage", "month", "$", "earn", "make", "paid", "1k", "2k", "3k", "4k", "5k",
-        ])
-        employment_signal = any(w in joined_borrower for w in [
-            "job", "work", "employ", "unemploy", "self-employ", "part-time", "full-time", "freelance",
-        ])
-        captured = sum([bool(identity_signal), bool(income_signal), bool(employment_signal)])
-
-        if captured >= 2 and len(agent_turns) >= 2:
+        verified = "verify_identity" in names
+        disclosures = sum(1 for tc in tool_calls if tc["name"] == "record_disclosure")
+        # 'assessed' = identity + 3+ disclosures captured
+        if verified and disclosures >= 3:
             return "assessed"
-        if captured >= 1:
+        if verified or disclosures >= 1:
             return "partial"
-        return "partial" if len(borrower_turns) >= 2 else "no_response"
+        if not transcript or len([t for t in transcript if t["role"] == "user"]) == 0:
+            return "no_response"
+        return "partial"
