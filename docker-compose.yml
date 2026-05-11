@@ -1,0 +1,62 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: riverline
+      POSTGRES_PASSWORD: riverline
+      POSTGRES_DB: riverline
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U riverline -d riverline"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  temporal:
+    image: temporalio/auto-setup:1.24
+    environment:
+      - DB=postgres12
+      - DB_PORT=5432
+      - POSTGRES_USER=riverline
+      - POSTGRES_PWD=riverline
+      - POSTGRES_SEEDS=postgres
+      - SKIP_DEFAULT_NAMESPACE_CREATION=false
+    ports:
+      - "7233:7233"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "temporal operator cluster health --address temporal:7233 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  temporal-ui:
+    image: temporalio/ui:2.27.2
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_CORS_ORIGINS=http://localhost:3000
+    ports:
+      - "8233:8080"
+    depends_on:
+      - temporal
+
+volumes:
+  postgres-data:
+  redis-data:
