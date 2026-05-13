@@ -132,7 +132,9 @@ def propose_variants(
             context=ctx,
             purpose="prompt_engineer",
             model=DEFAULT_PROPOSER_MODEL,
-            max_tokens=2000,
+            # Opus needs room for: rationale (~200 tok) + the full revised prompt
+            # (up to 1500 tok ceiling) + JSON syntax overhead. 4000 leaves headroom.
+            max_tokens=4000,
             temperature=0.7,
             iteration_id=iteration_id,
         ))

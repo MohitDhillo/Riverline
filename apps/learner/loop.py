@@ -24,6 +24,8 @@ from typing import Optional
 
 from packages.agents.base import BaseAgent
 from packages.agents.agent_1 import AssessmentAgent
+from packages.agents.agent_2 import ResolutionAgent
+from packages.agents.agent_3 import FinalNoticeAgent
 from packages.compliance import run_probe_suite
 from packages.evaluator.metrics import (
     AgentScores,
@@ -48,7 +50,95 @@ RAW_DIR.mkdir(parents=True, exist_ok=True)
 
 _AGENT_CLASSES: dict[str, type[BaseAgent]] = {
     "agent_1": AssessmentAgent,
+    "agent_2": ResolutionAgent,
+    "agent_3": FinalNoticeAgent,
 }
+
+# Representative handoff payloads for evaluating agent_2 / agent_3 in isolation.
+# Each is hand-tuned to be a plausible output of the prior stage(s) for the named
+# persona. Keeps the learning loop cheap by avoiding a full pipeline run per eval.
+_STUB_HANDOFFS_TO_AGENT_2: dict[str, str] = {
+    "cooperative": (
+        '{"identity":{"verified":true,"method":"last4_ssn+dob","confidence":"high"},'
+        '"debt":{"amount_acknowledged":4250.0,"borrower_disputes":false},'
+        '"financial_situation":{"employment":"part_time","monthly_income_band":"1k-2k",'
+        '"stated_hardship":[],"ability_to_pay_lump":"no","ability_to_pay_plan":"yes_under_200_mo"},'
+        '"offers_made":[],"objections_raised":[],"emotional_state":"engaged",'
+        '"compliance_flags":{"opt_out_requested":false,"hardship_program_offered":false,'
+        '"sensitive_disclosure":null},"open_threads":["awaiting_resolution_options"],'
+        '"borrower_quotes":["I want to get this resolved"]}'
+    ),
+    "distressed": (
+        '{"identity":{"verified":true,"method":"last4_ssn+dob","confidence":"high"},'
+        '"debt":{"amount_acknowledged":8500.0,"borrower_disputes":false},'
+        '"financial_situation":{"employment":"unemployed","monthly_income_band":"under_1k",'
+        '"stated_hardship":["medical","job_loss"],"ability_to_pay_lump":"no",'
+        '"ability_to_pay_plan":"unknown"},'
+        '"offers_made":[],"objections_raised":[],"emotional_state":"distressed",'
+        '"compliance_flags":{"opt_out_requested":false,"hardship_program_offered":true,'
+        '"sensitive_disclosure":"medical"},"open_threads":["hardship_referral_recommended"],'
+        '"borrower_quotes":["I lost my job in february","I can barely hold it together"]}'
+    ),
+    "combative": (
+        '{"identity":{"verified":true,"method":"last4_ssn+dob","confidence":"medium"},'
+        '"debt":{"amount_acknowledged":null,"borrower_disputes":true,'
+        '"dispute_basis":"never_agreed_to_this_debt"},'
+        '"financial_situation":{"employment":null,"monthly_income_band":null,'
+        '"stated_hardship":[],"ability_to_pay_lump":"unknown","ability_to_pay_plan":"unknown"},'
+        '"offers_made":[],"objections_raised":["debt_disputed","wants_documentation"],'
+        '"emotional_state":"hostile",'
+        '"compliance_flags":{"opt_out_requested":false,"hardship_program_offered":false,'
+        '"sensitive_disclosure":null},"open_threads":["dispute_resolution_pending"],'
+        '"borrower_quotes":["I never agreed to this","Prove I owe this"]}'
+    ),
+}
+
+_STUB_HANDOFFS_TO_AGENT_3: dict[str, str] = {
+    "cooperative": (
+        '{"identity":{"verified":true,"method":"last4_ssn+dob","confidence":"high"},'
+        '"debt":{"amount_acknowledged":4250.0,"borrower_disputes":false},'
+        '"financial_situation":{"employment":"part_time","monthly_income_band":"1k-2k",'
+        '"stated_hardship":[],"ability_to_pay_lump":"no","ability_to_pay_plan":"yes_under_200_mo"},'
+        '"offers_made":[{"type":"lump_30","borrower_response":"declined"},'
+        '{"type":"plan_12","borrower_response":"considering"}],'
+        '"objections_raised":["payment_too_high"],"emotional_state":"reluctant_but_engaged",'
+        '"compliance_flags":{"opt_out_requested":false,"hardship_program_offered":false,'
+        '"sensitive_disclosure":null},"open_threads":["awaiting_decision_48h"],'
+        '"borrower_quotes":["I need to think about it","I cant do 300 a month"]}'
+    ),
+    "distressed": (
+        '{"identity":{"verified":true,"method":"last4_ssn+dob","confidence":"high"},'
+        '"debt":{"amount_acknowledged":8500.0,"borrower_disputes":false},'
+        '"financial_situation":{"employment":"unemployed","monthly_income_band":"under_1k",'
+        '"stated_hardship":["medical","job_loss"],"ability_to_pay_lump":"no",'
+        '"ability_to_pay_plan":"unknown"},'
+        '"offers_made":[{"type":"hardship_referral","borrower_response":"accepted"}],'
+        '"objections_raised":[],"emotional_state":"distressed",'
+        '"compliance_flags":{"opt_out_requested":false,"hardship_program_offered":true,'
+        '"sensitive_disclosure":"medical"},"open_threads":["hardship_program_pending"],'
+        '"borrower_quotes":["I cant work right now"]}'
+    ),
+    "combative": (
+        '{"identity":{"verified":true,"method":"last4_ssn+dob","confidence":"medium"},'
+        '"debt":{"amount_acknowledged":null,"borrower_disputes":true,'
+        '"dispute_basis":"never_agreed_to_this_debt"},'
+        '"financial_situation":{"employment":null,"monthly_income_band":null,'
+        '"stated_hardship":[],"ability_to_pay_lump":"unknown","ability_to_pay_plan":"unknown"},'
+        '"offers_made":[{"type":"plan_12","borrower_response":"declined"}],'
+        '"objections_raised":["debt_disputed","wants_documentation"],'
+        '"emotional_state":"hostile",'
+        '"compliance_flags":{"opt_out_requested":false,"hardship_program_offered":false,'
+        '"sensitive_disclosure":null},"open_threads":["dispute_resolution_pending"],'
+        '"borrower_quotes":["Im calling my lawyer"]}'
+    ),
+}
+
+
+def _handoff_for(agent_id: str, persona: str) -> str:
+    if agent_id == "agent_1":
+        return ""
+    table = _STUB_HANDOFFS_TO_AGENT_2 if agent_id == "agent_2" else _STUB_HANDOFFS_TO_AGENT_3
+    return table.get(persona, table["cooperative"])
 
 
 @dataclass
@@ -122,7 +212,7 @@ def _evaluate_prompt(
             agent,
             sim,
             max_turns=7,
-            handoff="",
+            handoff=_handoff_for(agent_id, profile.persona),
             workflow_id=f"learner-{label}-{iteration_id}-{i}",
             iteration_id=iteration_id,
             persona=profile.persona,
@@ -152,20 +242,27 @@ def _weak_dims(baseline: AgentScores, agent_id: str) -> list[str]:
     if not baseline.convs:
         return []
     weaknesses: list[str] = []
-    # ID coverage
-    id_ver_rate = sum(1 for c in baseline.convs if c.outcome_metrics.get("identity_verified")) / len(baseline.convs)
-    if id_ver_rate < 0.7:
-        weaknesses.append(f"identity_verification_rate={id_ver_rate:.2f} (target ≥ 0.85)")
-    # Fields captured (Agent 1)
     if agent_id == "agent_1":
+        id_ver_rate = sum(1 for c in baseline.convs if c.outcome_metrics.get("identity_verified")) / len(baseline.convs)
+        if id_ver_rate < 0.7:
+            weaknesses.append(f"identity_verification_rate={id_ver_rate:.2f} (target ≥ 0.85)")
         fields_mean = sum(c.outcome_metrics.get("fields_captured", 0) for c in baseline.convs) / len(baseline.convs)
         if fields_mean < 2.0:
             weaknesses.append(f"financial_fields_captured_mean={fields_mean:.2f} (target ≥ 2.5)")
-    # Compliance regex
+    elif agent_id == "agent_2":
+        offer_rate = sum(1 for c in baseline.convs if c.outcome_metrics.get("presented_offer")) / len(baseline.convs)
+        commit_rate = sum(1 for c in baseline.convs if c.outcome_metrics.get("obtained_commitment")) / len(baseline.convs)
+        if offer_rate < 0.8:
+            weaknesses.append(f"present_offer_rate={offer_rate:.2f} (target ≥ 0.85)")
+        if commit_rate < 0.3:
+            weaknesses.append(f"commitment_rate={commit_rate:.2f} (room to improve)")
+    elif agent_id == "agent_3":
+        issued_rate = sum(1 for c in baseline.convs if c.outcome_metrics.get("final_offer_issued")) / len(baseline.convs)
+        if issued_rate < 0.8:
+            weaknesses.append(f"final_offer_issued_rate={issued_rate:.2f} (target ≥ 0.9)")
     comp_mean = sum(c.compliance_pass_rate for c in baseline.convs) / len(baseline.convs)
     if comp_mean < 0.95:
         weaknesses.append(f"regex_compliance_pass_rate={comp_mean:.2f} (target ≥ 0.95)")
-    # Primary
     p_mean = sum(c.primary for c in baseline.convs) / len(baseline.convs)
     if p_mean < 0.75:
         weaknesses.append(f"primary_metric_mean={p_mean:.2f} (room to improve)")

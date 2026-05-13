@@ -32,7 +32,7 @@ logging.basicConfig(
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--agent", default="agent_1",
-                   choices=["agent_1"],   # agent_2/3 in Day 4
+                   choices=["agent_1", "agent_2", "agent_3"],
                    help="Agent to evolve in this run.")
     p.add_argument("--iters", type=int, default=2)
     p.add_argument("--n", type=int, default=15, help="paired borrowers per iteration")
