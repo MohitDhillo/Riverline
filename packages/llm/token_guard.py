@@ -21,6 +21,11 @@ _ENC = tiktoken.get_encoding("cl100k_base")
 
 AGENT_BUDGET = 2000
 HANDOFF_BUDGET = 500
+# Meta layers (summarizer, rubric judge, compliance judge, prompt engineer) are NOT
+# bound by the 2000-token agent ceiling — that ceiling applies to the production
+# agents only. Meta calls use this much larger budget instead, well under the
+# model's 200K context window but enough to fit a full transcript + failure dump.
+META_BUDGET = 100_000
 
 
 class BudgetViolation(Exception):

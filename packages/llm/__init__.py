@@ -3,6 +3,7 @@ from packages.llm.client import AnthropicClient, LLMCall, LLMResponse
 from packages.llm.token_guard import (
     AGENT_BUDGET,
     HANDOFF_BUDGET,
+    META_BUDGET,
     AgentContext,
     BudgetViolation,
     count_tokens,
@@ -11,6 +12,7 @@ from packages.llm.token_guard import (
 __all__ = [
     "AGENT_BUDGET",
     "HANDOFF_BUDGET",
+    "META_BUDGET",
     "AgentContext",
     "BudgetViolation",
     "count_tokens",

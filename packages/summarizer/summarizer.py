@@ -14,7 +14,7 @@ import json
 import re
 from typing import Optional
 
-from packages.llm import AgentContext, AnthropicClient, LLMCall
+from packages.llm import AgentContext, AnthropicClient, LLMCall, META_BUDGET
 from packages.llm.client import DEFAULT_AGENT_MODEL
 from packages.summarizer.schema import HandoffPayload
 from packages.summarizer.trim import TrimResult, trim_to_budget
@@ -118,8 +118,8 @@ def summarize_for_handoff(
         system_prompt=SUMMARIZER_SYSTEM,
         handoff="",
         history=[{"role": "user", "content": user_msg}],
-    ).fit_to_budget()
-    ctx.assert_within()
+    ).fit_to_budget(META_BUDGET)
+    ctx.assert_within(agent_budget=META_BUDGET)
 
     resp = client.complete(LLMCall(
         context=ctx,

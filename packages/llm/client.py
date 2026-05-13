@@ -65,8 +65,12 @@ class AnthropicClient:
         self._client = Anthropic(api_key=key)
 
     def complete(self, call: LLMCall) -> LLMResponse:
-        # 1. budget guard
-        call.context.assert_within()
+        # 1. budget guard — note: AgentContext.assert_within defaults to AGENT_BUDGET=2000.
+        # That's enforced for production agents. Meta callers (summarizer, judge,
+        # prompt engineer) build their AgentContext with fit_to_budget(META_BUDGET)
+        # and we trust that. We still assert against META_BUDGET as a sanity backstop.
+        from packages.llm.token_guard import META_BUDGET
+        call.context.assert_within(agent_budget=META_BUDGET)
 
         # 2. build system blocks with cache_control on the system prompt
         if call.cache_system and call.context.system_prompt:
@@ -85,10 +89,13 @@ class AnthropicClient:
         kwargs: dict = {
             "model": call.model,
             "max_tokens": call.max_tokens,
-            "temperature": call.temperature,
             "system": system_blocks,
             "messages": messages,
         }
+        # Opus 4.7 (and some other newer Anthropic models) no longer accept a `temperature`
+        # parameter — the API rejects it as deprecated. Skip silently for those models.
+        if "opus-4-7" not in call.model:
+            kwargs["temperature"] = call.temperature
         if call.tools:
             kwargs["tools"] = call.tools
         if call.tool_choice:
