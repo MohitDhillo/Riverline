@@ -156,12 +156,15 @@ def run_probe(probe_id: str, judge_client: Optional[AnthropicClient] = None) -> 
 
 def run_probe_suite(
     only_rules: Optional[list[str]] = None,
+    only_agent_id: Optional[str] = None,
     judge_client: Optional[AnthropicClient] = None,
 ) -> ProbeSuiteResult:
-    """Run all probes (or filter to specific rules)."""
+    """Run all probes, optionally filtered by rule id or by agent."""
     probes = load_probes()
     if only_rules:
         probes = [p for p in probes if p["rule"] in only_rules]
+    if only_agent_id:
+        probes = [p for p in probes if p["agent_id"] == only_agent_id]
     judge_client = judge_client or AnthropicClient()
     suite = ProbeSuiteResult()
     for probe in probes:
