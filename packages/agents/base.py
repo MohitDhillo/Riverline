@@ -43,6 +43,7 @@ class AgentResult:
     turns: int
     transcript: list[dict]
     summary_note: Optional[str] = None
+    tool_calls: list[dict] = field(default_factory=list)
 
 
 class BaseAgent:
@@ -53,8 +54,22 @@ class BaseAgent:
     tools: list[dict] = []
     max_tool_iterations: int = 6
 
-    def __init__(self, client: Optional[AnthropicClient] = None) -> None:
+    def __init__(
+        self,
+        client: Optional[AnthropicClient] = None,
+        *,
+        override_prompt_text: Optional[str] = None,
+        override_prompt_version: Optional[int] = None,
+    ) -> None:
         self.client = client or AnthropicClient()
+        if override_prompt_text is not None:
+            # Test/learning-loop path — skip DB lookup so we can evaluate candidate prompts.
+            self.prompt_version_id = -1
+            self.prompt_version_num = override_prompt_version or -1
+            self.system_prompt = override_prompt_text
+            from packages.llm import count_tokens
+            self.system_prompt_tokens = count_tokens(override_prompt_text)
+            return
         pv = get_active_prompt(self.agent_id)
         self.prompt_version_id = pv.id
         self.prompt_version_num = pv.version
@@ -90,10 +105,11 @@ class BaseAgent:
             kwargs: dict = {
                 "model": self.model,
                 "max_tokens": self.max_tokens_out,
-                "temperature": self.temperature,
                 "system": system_blocks,
                 "messages": api_messages,
             }
+            if "opus-4-7" not in self.model:
+                kwargs["temperature"] = self.temperature
             if self.tools:
                 kwargs["tools"] = self.tools
 

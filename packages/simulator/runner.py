@@ -113,4 +113,5 @@ def run_chat_conversation(
         turns=seq,
         transcript=history,
         summary_note=f"tool_calls={len(all_tool_calls)}",
+        tool_calls=all_tool_calls,
     )
