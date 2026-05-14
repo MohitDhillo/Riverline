@@ -33,12 +33,14 @@ from packages.evaluator.metrics import (
     cheap_compliance,
     primary_metric,
 )
+from packages.evaluator.system_judge import judge_full_pipeline
 from packages.llm import AnthropicClient, count_tokens
 from packages.simulator.borrower import BorrowerProfile, BorrowerSimulator, load_borrowers
 from packages.simulator.runner import run_chat_conversation
 from packages.stats import GateDecision, evaluate_gate
 from packages.storage.repos import (
     get_active_prompt,
+    load_turns,
     set_active_prompt,
     upsert_prompt_version,
 )
@@ -155,6 +157,9 @@ class VariantResult:
     cohens_d: float = 0.0
     ci_lower: float = 0.0
     ci_upper: float = 0.0
+    seamlessness_baseline: Optional[float] = None
+    seamlessness_variant: Optional[float] = None
+    system_check_ran: bool = False
 
 
 @dataclass
@@ -186,6 +191,252 @@ def _pick_borrowers(n: int) -> list[BorrowerProfile]:
     while len(picked) < n and rest:
         picked.append(rest.pop(0))
     return picked[:n]
+
+
+# Personas we consider "real test fixtures" — used to filter DB reuse and to
+# exclude human-chat / probe / vapi conversations from learning samples.
+_SIM_PERSONAS = ("cooperative", "combative", "evasive", "confused", "distressed")
+
+
+def _aggregate_tool_calls_from_turns(conv_id: uuid.UUID) -> tuple[list[dict], list[dict]]:
+    """Re-load a conversation's transcript + flattened tool_calls from the DB.
+    Used by the baseline-reuse path (no LLM cost)."""
+    from sqlalchemy import select
+
+    from packages.storage.db import session_scope
+    from packages.storage.models import Turn
+
+    with session_scope() as s:
+        rows = s.execute(
+            select(Turn).where(Turn.conversation_id == conv_id).order_by(Turn.seq)
+        ).scalars().all()
+        transcript = [{"role": t.role, "content": t.content} for t in rows]
+        tool_calls: list[dict] = []
+        for t in rows:
+            if t.tool_calls and t.tool_calls.get("calls"):
+                tool_calls.extend(t.tool_calls["calls"])
+        return transcript, tool_calls
+
+
+def _load_baseline_from_db(
+    agent_id: str,
+    active_version: int,
+    n_target: int,
+    current_iteration_id: int,
+) -> Optional[tuple[AgentScores, list[BorrowerProfile]]]:
+    """Try to assemble a baseline AgentScores from previously-stored conversations.
+
+    Returns (AgentScores, borrowers) if we find >= n_target conversations matching:
+      - iteration_id IS NOT NULL (was a learning-loop run, not chat/probe/vapi)
+      - agent_versions[agent_id] == active_version
+      - persona ∈ _SIM_PERSONAS
+      - borrower_id resolvable to a profile in seeds.json (so the variant can be
+        evaluated on the SAME borrowers and the paired bootstrap stays valid)
+
+    No LLM calls — scores are re-computed from stored turns + tool_calls. The
+    returned borrower list is the EXACT set the variant must be paired against.
+    """
+    from sqlalchemy import select
+
+    from packages.storage.db import session_scope
+    from packages.storage.models import Conversation
+
+    with session_scope() as s:
+        candidates = s.execute(
+            select(Conversation)
+            .where(
+                Conversation.iteration_id.isnot(None),
+                Conversation.persona.in_(_SIM_PERSONAS),
+            )
+            .order_by(Conversation.id.desc())
+            .limit(n_target * 8)
+        ).scalars().all()
+        matching = [
+            c for c in candidates
+            if c.agent_versions and c.agent_versions.get(agent_id) == active_version
+        ]
+        # Index profiles by id so we can pair the variant on the SAME borrowers.
+        profiles_by_id = {b.id: b for b in load_borrowers()}
+        matching = [c for c in matching if str(c.borrower_id) in profiles_by_id]
+        # Dedupe by borrower_id — at most one stored convo per borrower (most recent).
+        seen: set[str] = set()
+        unique: list[Conversation] = []
+        for c in matching:
+            bid = str(c.borrower_id)
+            if bid in seen:
+                continue
+            seen.add(bid)
+            unique.append(c)
+        # Balance across personas first, then pad up to n_target from remainder.
+        per_persona = max(1, n_target // len(_SIM_PERSONAS))
+        by_persona: dict[str, list[Conversation]] = {}
+        for c in unique:
+            by_persona.setdefault(c.persona, []).append(c)
+        picked: list[Conversation] = []
+        leftover: list[Conversation] = []
+        for plist in by_persona.values():
+            picked.extend(plist[:per_persona])
+            leftover.extend(plist[per_persona:])
+        while len(picked) < n_target and leftover:
+            picked.append(leftover.pop(0))
+        if len(picked) < n_target:
+            return None
+        picked = picked[:n_target]
+        for c in picked:
+            s.expunge(c)
+
+    paired_profiles: list[BorrowerProfile] = [profiles_by_id[str(c.borrower_id)] for c in picked]
+    scores = AgentScores()
+    for c in picked:
+        transcript, tool_calls = _aggregate_tool_calls_from_turns(c.id)
+        primary, outcome_metrics = primary_metric(agent_id, transcript, tool_calls)
+        comp_dict = cheap_compliance(transcript, tool_calls)
+        comp_rate = sum(comp_dict.values()) / len(comp_dict)
+        system_value = 0.0 if c.outcome == "no_response" else 1.0
+        scores.add(
+            ConvScores(
+                conversation_id=str(c.id),
+                persona=c.persona,
+                agent_id=agent_id,
+                primary=primary,
+                outcome_metrics=outcome_metrics,
+                compliance=comp_dict,
+                compliance_pass_rate=comp_rate,
+            ),
+            system_value,
+        )
+    return scores, paired_profiles
+
+
+def _run_full_pipeline_inline(
+    profile: BorrowerProfile,
+    *,
+    variant_agent_id: Optional[str],
+    variant_prompt: Optional[str],
+    iteration_id: int,
+    client: AnthropicClient,
+    label: str,
+) -> list[tuple[str, list[dict]]]:
+    """Run A1 → summarize → A2 → summarize → A3 inline (no Temporal).
+
+    When ``variant_agent_id`` is given, that agent uses ``variant_prompt``; the
+    other two agents use their currently-active prompts. When variant_agent_id
+    is None, all three agents use active prompts (pure baseline).
+
+    Returns list of (agent_id, transcript) tuples per stage actually run.
+    Short-circuits early if Agent 1 yielded no usable data or Agent 2 closed a deal.
+    """
+    from packages.summarizer import summarize_for_handoff
+
+    def _prompt_for(agent_id: str) -> tuple[str, int]:
+        if variant_agent_id == agent_id and variant_prompt is not None:
+            return variant_prompt, -1
+        pv = get_active_prompt(agent_id)
+        return pv.prompt_text, pv.version
+
+    transcripts_per_stage: list[tuple[str, list[dict]]] = []
+
+    # --- stage 1 ---
+    p1_text, p1_ver = _prompt_for("agent_1")
+    a1 = AssessmentAgent(client=client, override_prompt_text=p1_text, override_prompt_version=p1_ver)
+    sim1 = BorrowerSimulator(profile, client=client)
+    conv1, res1 = run_chat_conversation(
+        a1, sim1, max_turns=7, handoff="",
+        workflow_id=f"sys-{label}-{iteration_id}-{profile.id[:8]}-1",
+        iteration_id=iteration_id, persona=profile.persona,
+    )
+    transcripts_per_stage.append(("agent_1", res1.transcript))
+    if res1.outcome in ("opt_out", "no_response", "identity_unverified"):
+        return transcripts_per_stage
+
+    # --- handoff 1 → 2 ---
+    turns1 = _aggregate_tool_calls_from_turns(conv1)[0]
+    h2 = summarize_for_handoff(
+        [{"role": t["role"], "content": t["content"], "agent_id": "agent_1"} for t in turns1],
+        to_agent="to_agent_2",
+        conversation_id=str(conv1),
+        iteration_id=iteration_id,
+    )
+
+    # --- stage 2 ---
+    p2_text, p2_ver = _prompt_for("agent_2")
+    a2 = ResolutionAgent(client=client, override_prompt_text=p2_text, override_prompt_version=p2_ver)
+    sim2 = BorrowerSimulator(profile, client=client)
+    conv2, res2 = run_chat_conversation(
+        a2, sim2, max_turns=7, handoff=h2.payload.to_compact_json(),
+        workflow_id=f"sys-{label}-{iteration_id}-{profile.id[:8]}-2",
+        iteration_id=iteration_id, persona=profile.persona,
+    )
+    transcripts_per_stage.append(("agent_2", res2.transcript))
+    if res2.outcome in ("deal_agreed", "opt_out"):
+        return transcripts_per_stage
+
+    # --- handoff 2 → 3 ---
+    turns_combined = _aggregate_tool_calls_from_turns(conv1)[0] + _aggregate_tool_calls_from_turns(conv2)[0]
+    h3 = summarize_for_handoff(
+        [{"role": t["role"], "content": t["content"], "agent_id": "borrower"} for t in turns_combined],
+        to_agent="to_agent_3",
+        conversation_id=str(conv2),
+        iteration_id=iteration_id,
+    )
+
+    # --- stage 3 ---
+    p3_text, p3_ver = _prompt_for("agent_3")
+    a3 = FinalNoticeAgent(client=client, override_prompt_text=p3_text, override_prompt_version=p3_ver)
+    sim3 = BorrowerSimulator(profile, client=client)
+    conv3, res3 = run_chat_conversation(
+        a3, sim3, max_turns=7, handoff=h3.payload.to_compact_json(),
+        workflow_id=f"sys-{label}-{iteration_id}-{profile.id[:8]}-3",
+        iteration_id=iteration_id, persona=profile.persona,
+    )
+    transcripts_per_stage.append(("agent_3", res3.transcript))
+    return transcripts_per_stage
+
+
+def _system_level_check(
+    agent_id: str,
+    variant_prompt: str,
+    iteration_id: int,
+    client: AnthropicClient,
+    n: int = 3,
+) -> tuple[list[float], list[float]]:
+    """Run N=3 full A1→A2→A3 pipelines for baseline (all active) and variant
+    (variant in its slot, active elsewhere). Score handoff seamlessness via
+    system_judge. Returns paired score lists in [1..5].
+
+    Cost: ~$0.50-1 per call. Only invoked AFTER a variant passes the per-agent gate.
+    Never called for agent_3 (no downstream agents to disturb).
+    """
+    borrowers = _pick_borrowers(n)
+    baseline_scores: list[float] = []
+    variant_scores: list[float] = []
+
+    for profile in borrowers:
+        # baseline run — no variant
+        try:
+            bt = _run_full_pipeline_inline(
+                profile, variant_agent_id=None, variant_prompt=None,
+                iteration_id=iteration_id, client=client, label="sys-baseline",
+            )
+            br = judge_full_pipeline(bt, client=client, iteration_id=iteration_id)
+            if br and "handoff_seamlessness" in br:
+                baseline_scores.append(float(br["handoff_seamlessness"]))
+        except Exception as e:
+            log.warning("    system check: baseline pipeline failed: %s", e)
+
+        # variant run
+        try:
+            vt = _run_full_pipeline_inline(
+                profile, variant_agent_id=agent_id, variant_prompt=variant_prompt,
+                iteration_id=iteration_id, client=client, label="sys-variant",
+            )
+            vr = judge_full_pipeline(vt, client=client, iteration_id=iteration_id)
+            if vr and "handoff_seamlessness" in vr:
+                variant_scores.append(float(vr["handoff_seamlessness"]))
+        except Exception as e:
+            log.warning("    system check: variant pipeline failed: %s", e)
+
+    return baseline_scores, variant_scores
 
 
 def _evaluate_prompt(
@@ -334,15 +585,29 @@ def run_iteration(
     log.info("\n%s  ITERATION %d  agent=%s  N=%d  %s", "=" * 12, iteration_id, agent_id, n_borrowers, "=" * 12)
 
     active = get_active_prompt(agent_id)
-    borrowers = _pick_borrowers(n_borrowers)
-    log.info("baseline: prompt v%d (%d tokens), %d borrowers",
-             active.version, active.prompt_tokens, len(borrowers))
+    log.info("baseline: prompt v%d (%d tokens), targeting %d borrowers",
+             active.version, active.prompt_tokens, n_borrowers)
 
-    # ---- baseline ----
-    baseline = _evaluate_prompt(
-        agent_id, active.prompt_text, active.version,
-        borrowers, iteration_id, client, label="baseline",
+    # ---- baseline: try DB reuse first, fall back to fresh run ----
+    # When we reuse, the variant MUST run on the exact same borrowers (paired bootstrap).
+    reuse = _load_baseline_from_db(
+        agent_id=agent_id,
+        active_version=active.version,
+        n_target=n_borrowers,
+        current_iteration_id=iteration_id,
     )
+    if reuse is not None:
+        baseline, borrowers = reuse
+        log.info("baseline: REUSED %d stored conversations for agent_%s v%d "
+                 "(no fresh LLM calls; variant will be paired on same borrowers)",
+                 len(baseline.convs), agent_id[-1], active.version)
+    else:
+        borrowers = _pick_borrowers(n_borrowers)
+        log.info("baseline: no reusable stored data — running %d fresh conversations", n_borrowers)
+        baseline = _evaluate_prompt(
+            agent_id, active.prompt_text, active.version,
+            borrowers, iteration_id, client, label="baseline",
+        )
     p_mean = sum(baseline.primary) / len(baseline.primary)
     c_mean = sum(baseline.compliance) / len(baseline.compliance)
     log.info("baseline: primary_mean=%.3f compliance_mean=%.3f", p_mean, c_mean)
@@ -414,9 +679,46 @@ def run_iteration(
         v.ci_lower = gate.bootstrap.ci_lower
         v.ci_upper = gate.bootstrap.ci_upper
         log.info(
-            "    gate=%s  primary_diff=%+.3f  d=%.2f  CI=[%+.3f, %+.3f]",
+            "    per-agent gate=%s  primary_diff=%+.3f  d=%.2f  CI=[%+.3f, %+.3f]",
             v.gate_decision, v.primary_diff, v.cohens_d, v.ci_lower, v.ci_upper,
         )
+
+        # ---- system-level check (only if per-agent gate passes AND agent has downstream) ----
+        if gate.decision == GateDecision.ADOPT and agent_id in ("agent_1", "agent_2"):
+            log.info("    running system-level check: %d full pipelines × 2 (baseline + variant) …", 3)
+            sys_baseline, sys_variant = _system_level_check(
+                agent_id=agent_id,
+                variant_prompt=prop.prompt_text,
+                iteration_id=iteration_id,
+                client=client,
+                n=3,
+            )
+            v.system_check_ran = True
+            v.seamlessness_baseline = (
+                sum(sys_baseline) / len(sys_baseline) if sys_baseline else None
+            )
+            v.seamlessness_variant = (
+                sum(sys_variant) / len(sys_variant) if sys_variant else None
+            )
+            log.info(
+                "    system check: seamlessness baseline=%.2f variant=%.2f (n=%d/%d)",
+                v.seamlessness_baseline or 0.0, v.seamlessness_variant or 0.0,
+                len(sys_baseline), len(sys_variant),
+            )
+            # Re-run gate with seamlessness data included
+            gate = evaluate_gate(
+                baseline_primary=baseline.primary,
+                variant_primary=vscores.primary,
+                baseline_compliance=baseline.compliance,
+                variant_compliance=vscores.compliance,
+                baseline_system=baseline.system,
+                variant_system=vscores.system,
+                baseline_seamlessness=sys_baseline,
+                variant_seamlessness=sys_variant,
+            )
+            v.gate_decision = gate.decision.value
+            v.gate_reasons = gate.reasons
+
         if gate.decision == GateDecision.ADOPT:
             new_version = active.version + 1
             new_id = upsert_prompt_version(
@@ -435,6 +737,8 @@ def run_iteration(
                     "compliance_baseline": gate.compliance_baseline,
                     "compliance_variant": gate.compliance_variant,
                     "system_p": gate.system_p,
+                    "seamlessness_baseline": v.seamlessness_baseline,
+                    "seamlessness_variant": v.seamlessness_variant,
                     "rationale": prop.rationale,
                 },
             )
