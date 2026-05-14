@@ -1,4 +1,4 @@
-.PHONY: fresh-start up down seed test smoke chat chat-sim vapi-call rerun-eval meta-eval worker api logs clean costs
+.PHONY: fresh-start up down seed test smoke chat chat-sim vapi-call rerun-eval meta-eval lift-prompts worker api logs clean costs
 
 # Boot everything from cold (target: <5 min, FINAL_PLAN §13)
 fresh-start: up seed test
@@ -40,6 +40,10 @@ rerun-eval:
 
 meta-eval:
 	uv run python scripts/run_meta_eval.py $(if $(ITERATION),--iteration $(ITERATION),)
+
+# Write currently-active prompts back to disk so adoptions are visible in the repo.
+lift-prompts:
+	uv run python scripts/lift_active_prompts.py
 
 worker:
 	uv run python -m apps.workflow.worker
