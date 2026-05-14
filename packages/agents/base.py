@@ -82,7 +82,16 @@ class BaseAgent:
         handoff: str = "",
         conversation_id: Optional[str] = None,
         iteration_id: Optional[int] = None,
+        *,
+        verification_data: Optional[dict] = None,
     ) -> AgentReply:
+        """One agent turn.
+
+        ``verification_data`` is the borrower's TRUE identity record (last4_ssn, dob,
+        name). When provided, ``verify_identity`` tool calls compare against it and
+        return verified=false on mismatch. When None (e.g. compliance probes with a
+        ScriptedBorrower), the tool accepts everything — legacy behavior.
+        """
         ctx = AgentContext(
             system_prompt=self.system_prompt,
             handoff=handoff,
@@ -97,7 +106,7 @@ class BaseAgent:
             "text": self.system_prompt,
             "cache_control": {"type": "ephemeral"},
         }]
-        recorder = ToolRecorder()
+        recorder = ToolRecorder(verification_data=verification_data)
         total_cost = 0.0
         final_text = ""
 
