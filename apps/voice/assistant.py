@@ -22,8 +22,8 @@ def build_assistant_config(
     handoff_json: str,
     *,
     borrower_name: Optional[str] = None,
-    model: str = "claude-haiku-4-5",
-    voice: str = "burt",   # Vapi default; switch in dashboard for production
+    model: str = "claude-haiku-4-5-20251001",
+    voice: str = "Harry",
     first_message: Optional[str] = None,
 ) -> dict:
     """Build the assistant override payload for one outbound Vapi call.
@@ -36,13 +36,19 @@ def build_assistant_config(
     system_prompt = pv.prompt_text + (
         "\n\n# Inbound handoff context from Agent 1 (chat assessment stage):\n"
         f"```json\n{handoff_json}\n```\n"
-        "Use this. Do not re-ask anything already captured here."
+        "Use this. Do not re-ask anything already captured here.\n\n"
+        "# Voice call control\n"
+        "This call runs on Vapi. When your Riverline prompt says to call "
+        "`end_conversation(...)`, say the final borrower-facing sentence first, "
+        "then immediately use the Vapi `endCall` tool. Also use `endCall` if the "
+        "borrower asks to stop contact, says goodbye, or clearly indicates the "
+        "conversation is over."
     )
 
     opener = first_message or (
-        "Hello, this is an AI assistant calling on behalf of Apex Recovery Services "
-        "about your outstanding account with First Coastal Bank. This call is being "
-        "recorded for compliance. Do you have a few minutes to discuss your options?"
+        "Hello, this is an AI assistant from Riverline Collections calling about "
+        "your outstanding account with Cred. This call is being recorded for "
+        "compliance. Do you have a few minutes to discuss your options?"
     )
 
     return {
@@ -58,12 +64,18 @@ def build_assistant_config(
                 }
             ],
             "temperature": 0.3,
+            "tools": [{"type": "endCall"}],
         },
         "voice": {"provider": "vapi", "voiceId": voice},
         "transcriber": {"provider": "deepgram", "model": "nova-2"},
-        # End the call when borrower asks or the agent issues record_commitment.
-        "endCallPhrases": ["goodbye", "thank you for your time", "stop calling me"],
-        "maxDurationSeconds": 600,
+        "endCallPhrases": [
+            "goodbye",
+            "thank you for your time",
+            "stop calling me",
+            "you will receive written confirmation",
+            "you will receive a written final notice",
+        ],
+        "maxDurationSeconds": 300,
         "recordingEnabled": True,
         "serverMessages": ["status-update", "end-of-call-report"],
         "metadata": {

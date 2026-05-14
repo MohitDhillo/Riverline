@@ -86,7 +86,12 @@ class VapiClient:
             body["assistant"]["serverUrl"] = callback
         with httpx.Client(timeout=30.0) as c:
             r = c.post(f"{VAPI_BASE}/call", headers=self._headers(), json=body)
-            r.raise_for_status()
+            try:
+                r.raise_for_status()
+            except httpx.HTTPStatusError as e:
+                raise RuntimeError(
+                    f"Vapi call creation failed: {r.status_code} {r.text}"
+                ) from e
             data = r.json()
         return VapiCallResult(
             call_id=data.get("id", ""),

@@ -104,18 +104,24 @@ async def _run_agent_2_via_vapi(
     """Place an outbound Vapi call. Returns once the call has been initiated;
     the final transcript arrives later via /voice/callback (see apps/voice/webhook.py).
 
-    For the Day 5 demo we don't block the workflow on call-end — the audio
-    recording is the deliverable. A signal-driven version that blocks until the
-    webhook fires is straightforward to add (see decision-journal notes).
+    Borrower routing:
+      - DEMO_BORROWER_PHONE in .env takes priority — used in dev so the call lands
+        on the operator's real phone instead of the seeded fake number.
+      - Otherwise falls back to profile.phone (real production deployment).
     """
     from apps.voice.client import VapiClient
 
-    if not profile.phone:
-        raise RuntimeError(f"borrower {profile.id} has no phone number on file")
+    demo_override = settings().demo_borrower_phone
+    to_number = demo_override.strip() if demo_override else profile.phone
+    if not to_number:
+        raise RuntimeError(
+            f"no phone number to dial: set DEMO_BORROWER_PHONE in .env "
+            f"or ensure profile {profile.id} has a real .phone"
+        )
 
     client = VapiClient()
     result = client.start_outbound_call(
-        to_number=profile.phone,
+        to_number=to_number,
         handoff_json=inp.handoff,
         borrower_name=profile.name,
     )
