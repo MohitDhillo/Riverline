@@ -25,6 +25,7 @@ import json
 import os
 import random
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -41,7 +42,9 @@ from packages.simulator.human_borrower import HumanBorrower
 from packages.simulator.runner import run_chat_conversation
 from packages.storage import init_schema
 from packages.storage.repos import (
+    add_turn,
     create_conversation,
+    end_conversation,
     install_cost_persistence,
     load_turns,
     record_handoff,
@@ -75,6 +78,26 @@ def _system(msg: str) -> None:
 def _toolcall_line(tc: dict) -> str:
     args = tc.get("input") or {}
     return f"{_MAGENTA}🔧 {tc['name']}({json.dumps(args, separators=(',', ':'))}){_RESET}"
+
+
+def _ask_stage2_mode(demo_phone: str) -> bool:
+    """Returns True if the user wants Vapi voice for Stage 2, else False (text)."""
+    print()
+    print(f"{_BOLD}{_CYAN}━━━ Stage 2 (Resolution) — how should the agent reach you? ━━━{_RESET}")
+    print(f"  {_BOLD}[t]{_RESET} text   — keep typing in this terminal")
+    print(f"  {_BOLD}[v]{_RESET} voice  — Vapi calls you on "
+          f"{demo_phone or '(DEMO_BORROWER_PHONE not set in .env)'}")
+    while True:
+        try:
+            raw = input(f"{_BOLD}choose [t/v]:{_RESET} ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print(f"\n{_DIM}defaulting to text mode{_RESET}")
+            return False
+        if raw in ("v", "voice", "call"):
+            return True
+        if raw in ("t", "text", "type", ""):
+            return False
+        print(f"{_DIM}  (pick 't' or 'v'){_RESET}")
 
 
 def pick_borrower(persona: str | None, borrower_id: str | None) -> BorrowerProfile:
@@ -136,6 +159,113 @@ def run_stage(
     return new_conv_id, result.outcome, result.tool_calls
 
 
+def run_stage_2_voice(
+    handoff_json: str,
+    profile: BorrowerProfile,
+    conv_id: uuid.UUID,
+) -> tuple[str, list[dict]]:
+    """Run Stage 2 over a REAL Vapi outbound call. Polls Vapi until call ends,
+    then persists the transcript into the same `turns` table the text path uses
+    so the Stage 2→3 summarizer can read it identically.
+
+    Returns (outcome_label, transcript).
+    """
+    from apps.voice.client import VapiClient
+
+    s = settings()
+    target = s.demo_borrower_phone
+    if not s.vapi_api_key or not target:
+        print(f"{_YELLOW}voice mode requested but Vapi not configured "
+              f"(VAPI_API_KEY={'set' if s.vapi_api_key else 'missing'}; "
+              f"DEMO_BORROWER_PHONE={'set' if target else 'missing'}). "
+              f"Falling back to text mode.{_RESET}")
+        return "vapi_unconfigured", []
+
+    print(f"\n{_BOLD}{_CYAN}-- Initiating Vapi call to {target} for {profile.name} --{_RESET}")
+    print(f"{_DIM}Pick up your phone. The agent will speak first. "
+          f"Recording is enabled.{_RESET}")
+    client = VapiClient()
+    res = client.start_outbound_call(
+        to_number=target,
+        handoff_json=handoff_json,
+        borrower_name=profile.name,
+    )
+    if not res.call_id:
+        print(f"{_YELLOW}Vapi did not return a call_id. Raw: {json.dumps(res.raw)[:200]}{_RESET}")
+        return "vapi_failed", []
+    print(f"{_DIM}call_id={res.call_id}  initial status={res.status}{_RESET}")
+
+    # Poll Vapi until the call ends (or 10 min cap).
+    waited = 0
+    info: dict = {}
+    while waited < 600:
+        time.sleep(8); waited += 8
+        try:
+            info = client.get_call(res.call_id)
+        except Exception as e:
+            print(f"{_DIM}  [{waited:>3}s] poll error: {e}{_RESET}")
+            continue
+        status = info.get("status", "unknown")
+        ended = info.get("endedAt") or status in ("ended", "failed", "busy", "no-answer")
+        if ended:
+            break
+        print(f"{_DIM}  [{waited:>3}s] status={status}{_RESET}")
+    else:
+        print(f"{_YELLOW}Timed out waiting for call to end. "
+              f"Check the Vapi dashboard for call_id={res.call_id}.{_RESET}")
+        return "vapi_timeout", []
+
+    artifact = info.get("artifact") or {}
+    messages = (artifact.get("messages") or info.get("messages") or [])
+    recording_url = artifact.get("recordingUrl") or info.get("recordingUrl")
+    ended_reason = info.get("endedReason") or "unknown"
+    print(f"\n{_BOLD}call ended. reason={ended_reason}  recording={recording_url or '(pending in dashboard)'}{_RESET}")
+
+    # Persist into the same shape the text-mode runner uses.
+    transcript: list[dict] = []
+    seq = 0
+    for m in messages:
+        raw_role = m.get("role", "assistant")
+        if raw_role == "system":
+            continue
+        if raw_role == "bot":
+            role = "assistant"
+        elif raw_role in ("user", "tool", "tool_calls", "tool_call_result"):
+            role = "user" if raw_role == "user" else "tool"
+        else:
+            role = "assistant"
+        content = m.get("message") or m.get("content") or ""
+        if not content:
+            continue
+        seq += 1
+        transcript.append({"role": role, "content": content})
+        add_turn(
+            conversation_id=conv_id,
+            seq=seq,
+            agent_id="agent_2" if role == "assistant" else "borrower",
+            role=role,
+            content=content,
+            token_counts=None,
+            tool_calls=None,
+        )
+
+    # Heuristic outcome from the borrower-facing text.
+    flat = " ".join((m.get("message") or m.get("content") or "") for m in messages).lower()
+    if "stop calling" in flat or "do not contact" in flat:
+        outcome = "opt_out"
+    elif "agree" in flat and ("plan" in flat or "monthly" in flat or "settlement" in flat or "lump" in flat):
+        outcome = "deal_agreed"
+    elif "hardship" in flat and "referral" in flat:
+        outcome = "escalate_hardship"
+    else:
+        outcome = "no_deal"
+    end_conversation(conv_id, outcome)
+    print(f"{_BOLD}-- voice stage 2 outcome: {outcome}  ({len(transcript)} turns){_RESET}")
+    if recording_url:
+        print(f"{_DIM}audio: {recording_url}{_RESET}")
+    return outcome, transcript
+
+
 def summarize_stage(conv_ids: list[uuid.UUID], to_agent: str) -> str:
     _banner(f"HANDOFF → {to_agent}", color=_CYAN)
     _system(f"summarizing {len(conv_ids)} conversation(s) into a ≤500-token JSON payload …")
@@ -174,6 +304,10 @@ def main() -> int:
     p.add_argument("--max-stage", type=int, default=3, choices=[1, 2, 3],
                    help="Stop after this stage (default 3 = run full pipeline).")
     p.add_argument("--max-turns", type=int, default=12)
+    p.add_argument("--stage2-mode", choices=["text", "voice", "ask"], default="ask",
+                   help="How Stage 2 (Resolution) runs in human mode. "
+                        "'ask' (default) prompts you interactively; 'voice' uses Vapi to call you; "
+                        "'text' keeps typing.")
     args = p.parse_args()
 
     s = settings()
@@ -216,15 +350,33 @@ def main() -> int:
     # ---- handoff 1→2 ----
     handoff_json = summarize_stage(conv_ids, "to_agent_2")
 
-    # ---- stage 2 ----
-    a2 = ResolutionAgent()
+    # ---- stage 2: ask user how to handle Resolution (text vs Vapi voice call) ----
     cid2 = create_conversation(
         borrower_id=uuid.UUID(profile.id),
         persona=profile.persona,
-        agent_versions={"agent_2": a2.prompt_version_num},
+        agent_versions={"agent_2": ResolutionAgent().prompt_version_num},
     )
     conv_ids.append(cid2)
-    _, outcome2, _ = run_stage(2, a2, borrower, handoff_json, args.max_turns, cid2)
+
+    stage2_voice = False
+    if args.mode == "human":
+        # Honor --stage2-mode flag, else prompt.
+        if args.stage2_mode == "voice":
+            stage2_voice = True
+        elif args.stage2_mode == "text":
+            stage2_voice = False
+        else:
+            stage2_voice = _ask_stage2_mode(s.demo_borrower_phone)
+
+    if stage2_voice:
+        outcome2, _t = run_stage_2_voice(handoff_json, profile, cid2)
+        if outcome2 in ("vapi_unconfigured", "vapi_failed", "vapi_timeout"):
+            print(f"{_YELLOW}falling back to text-mode Stage 2{_RESET}")
+            a2 = ResolutionAgent()
+            _, outcome2, _ = run_stage(2, a2, borrower, handoff_json, args.max_turns, cid2)
+    else:
+        a2 = ResolutionAgent()
+        _, outcome2, _ = run_stage(2, a2, borrower, handoff_json, args.max_turns, cid2)
 
     if outcome2 == "deal_agreed":
         _banner("** DEAL AGREED **", color=_GREEN)
