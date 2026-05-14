@@ -6,6 +6,10 @@ rejects land with status='rejected', evidence in `adoption_data`. CSV + JSON
 summary per iteration in data/raw_evaluations/.
 
     python scripts/run_learning_loop.py --agent agent_1 --iters 2 --n 15
+
+Default evaluation mode is `full`: every baseline and variant sample runs through
+the real A1→summarizer→A2→summarizer→A3 path. Use `--eval-mode isolated` only
+when you intentionally want the old cheaper stub-handoff evaluation.
 """
 
 from __future__ import annotations
@@ -37,11 +41,14 @@ def main() -> int:
     p.add_argument("--iters", type=int, default=2)
     p.add_argument("--n", type=int, default=15, help="paired borrowers per iteration")
     p.add_argument("--variants", type=int, default=2, help="variants proposed per iteration")
+    p.add_argument("--eval-mode", choices=["full", "isolated"], default="full",
+                   help="full = run A1→A2→A3 for each sample; isolated = old cheap stub handoffs")
     args = p.parse_args()
 
     s = settings()
     if not s.anthropic_api_key or not s.anthropic_api_key.startswith("sk-ant-"):
-        print("ERROR: ANTHROPIC_API_KEY missing in .env"); return 2
+        print("ERROR: ANTHROPIC_API_KEY missing in .env")
+        return 2
 
     install_cost_persistence()
     init_schema()
@@ -55,6 +62,7 @@ def main() -> int:
                 iteration_id=it,
                 n_borrowers=args.n,
                 n_variants=args.variants,
+                eval_mode=args.eval_mode,
             )
             spent_now = budget().spent()
             print(f"\niteration {it} done. session spend: ${spent_now:.6f}  "

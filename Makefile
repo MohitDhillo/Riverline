@@ -36,7 +36,7 @@ vapi-call:
 	uv run python scripts/vapi_call.py $(if $(PERSONA),--persona $(PERSONA),) $(if $(TO),--to $(TO),)
 
 rerun-eval:
-	uv run python scripts/run_learning_loop.py --agent $(or $(AGENT),agent_1) --iters $(or $(ITERS),2) --n $(or $(N),15) --variants $(or $(VARIANTS),2)
+	uv run python scripts/run_learning_loop.py --agent $(or $(AGENT),agent_1) --iters $(or $(ITERS),2) --n $(or $(N),15) --variants $(or $(VARIANTS),2) --eval-mode $(or $(EVAL_MODE),full)
 
 meta-eval:
 	uv run python scripts/run_meta_eval.py $(if $(ITERATION),--iteration $(ITERATION),)

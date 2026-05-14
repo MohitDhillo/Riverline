@@ -146,7 +146,7 @@ The primary metric is deliberately objective. The LLM rubric judge produces addi
 3. **Compliance not regressed** — variant's pass rate on the cheap regex rules ≥ baseline.
 4. **System non-inferiority** — bootstrap p > 0.10 that the variant is worse than baseline by margin 0.05 on the system outcome metric.
 
-After a variant clears the per-agent gate (for Agent 1 and Agent 2), the loop also runs `system_judge` on N=3 full A1→A2→A3 pipelines and rejects the variant if handoff seamlessness drops more than 0.5 on the 1-5 scale.
+Default `make rerun-eval` now runs every paired baseline/variant sample through the full A1→summarizer→A2→summarizer→A3 path. The old cheaper stub-handoff path is still available with `EVAL_MODE=isolated` for quota-constrained debugging.
 
 Paired evaluation is the point. With N=15 the persona variance is large; pairing the variant against the same borrowers as the baseline kills most of it. Bootstrap because the primary metric isn't normally distributed.
 
@@ -247,7 +247,7 @@ Prompt caching never engaged. Haiku's cache minimum is ~2048 tokens; the agent s
 1. **Stat gate is conservative on small N.** A Day 3 iteration rejected a variant with +9.4% primary lift and Cohen's d = 0.33 because the bootstrap CI lower bound was at -0.018. With N=30 the CI tightens by about √2 and the variant adopts. N=15 was the budget-constrained choice.
 2. **Voice integration is fire-and-forget.** The Vapi flow places the call and returns immediately; transcripts land via webhook into the same `turns` table the text-mode pipeline uses. A fully blocking workflow would use a Temporal `call_ended` signal.
 3. **No auto-rollback trigger.** Manual rollback is a one-row SQL update on `active_prompt`. The "revert if rolling-20 mean drops > 1σ" trigger described in early planning was not built.
-4. **Stub handoffs in the learning loop.** Agent 2 and Agent 3 evaluation use representative stub handoff JSONs per persona instead of running A1→A2→A3 for every paired evaluation. The system-level check (handoff seamlessness on N=3 full pipelines) partly compensates, but only fires post-per-agent-gate.
+4. **Full-pipeline eval is expensive.** `make rerun-eval` now evaluates variants inside full A1→A2→A3 runs, which is cleaner but costs more and adds upstream-agent variance. For quick debugging there is still `make rerun-eval EVAL_MODE=isolated`, which uses representative stub handoffs.
 5. **Borrower simulator and agents are same model family.** Risk of mode collapse where both sides converge on the same conversational patterns. Mitigated by 5 distinct persona prompts; not eliminated.
 6. **Rubric judge is not in the adoption decision.** Only the objective primary metric drives the gate. If the rubric judge fed adoption, judge-noise variance would need to be reduced first (re-run-and-average), which the meta-evaluator already hints at.
 7. **Prompt cache never engaged.** Haiku's cache minimum is bigger than the system prompts. Padding past the threshold for cache savings would be wasteful at $10 total spend.

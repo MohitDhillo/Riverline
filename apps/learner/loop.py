@@ -17,15 +17,16 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from packages.agents.base import BaseAgent
+from apps.learner.prompt_engineer import PromptProposal, propose_variants
 from packages.agents.agent_1 import AssessmentAgent
 from packages.agents.agent_2 import ResolutionAgent
 from packages.agents.agent_3 import FinalNoticeAgent
+from packages.agents.base import BaseAgent
 from packages.compliance import run_probe_suite
 from packages.evaluator.metrics import (
     AgentScores,
@@ -40,11 +41,9 @@ from packages.simulator.runner import run_chat_conversation
 from packages.stats import GateDecision, evaluate_gate
 from packages.storage.repos import (
     get_active_prompt,
-    load_turns,
     set_active_prompt,
     upsert_prompt_version,
 )
-from apps.learner.prompt_engineer import PromptProposal, propose_variants
 
 log = logging.getLogger("learner")
 RAW_DIR = Path(__file__).resolve().parents[2] / "data" / "raw_evaluations"
@@ -166,6 +165,7 @@ class VariantResult:
 class IterationResult:
     iteration_id: int
     agent_id: str
+    eval_mode: str
     baseline_prompt_version: int
     baseline_prompt_tokens: int
     baseline_primary_mean: float
@@ -177,6 +177,15 @@ class IterationResult:
     cost_usd_iteration: float = 0.0
 
 
+@dataclass
+class PipelineStageRun:
+    agent_id: str
+    conversation_id: uuid.UUID
+    outcome: str
+    transcript: list[dict]
+    tool_calls: list[dict]
+
+
 def _pick_borrowers(n: int) -> list[BorrowerProfile]:
     """Pick n borrowers — balanced across personas if possible."""
     by_persona: dict[str, list[BorrowerProfile]] = {}
@@ -184,7 +193,7 @@ def _pick_borrowers(n: int) -> list[BorrowerProfile]:
         by_persona.setdefault(b.persona, []).append(b)
     per = max(1, n // len(by_persona))
     picked: list[BorrowerProfile] = []
-    for persona, lst in by_persona.items():
+    for _persona, lst in by_persona.items():
         picked.extend(lst[:per])
     # top up if short
     rest = [b for plist in by_persona.values() for b in plist[per:]]
@@ -210,7 +219,15 @@ def _aggregate_tool_calls_from_turns(conv_id: uuid.UUID) -> tuple[list[dict], li
         rows = s.execute(
             select(Turn).where(Turn.conversation_id == conv_id).order_by(Turn.seq)
         ).scalars().all()
-        transcript = [{"role": t.role, "content": t.content} for t in rows]
+        transcript = [
+            {
+                "agent_id": t.agent_id,
+                "role": t.role,
+                "content": t.content,
+                "seq": t.seq,
+            }
+            for t in rows
+        ]
         tool_calls: list[dict] = []
         for t in rows:
             if t.tool_calls and t.tool_calls.get("calls"):
@@ -313,28 +330,29 @@ def _run_full_pipeline_inline(
     *,
     variant_agent_id: Optional[str],
     variant_prompt: Optional[str],
+    variant_prompt_version: Optional[int] = None,
     iteration_id: int,
     client: AnthropicClient,
     label: str,
-) -> list[tuple[str, list[dict]]]:
+) -> list[PipelineStageRun]:
     """Run A1 → summarize → A2 → summarize → A3 inline (no Temporal).
 
     When ``variant_agent_id`` is given, that agent uses ``variant_prompt``; the
     other two agents use their currently-active prompts. When variant_agent_id
     is None, all three agents use active prompts (pure baseline).
 
-    Returns list of (agent_id, transcript) tuples per stage actually run.
+    Returns stage records for each stage actually run.
     Short-circuits early if Agent 1 yielded no usable data or Agent 2 closed a deal.
     """
     from packages.summarizer import summarize_for_handoff
 
     def _prompt_for(agent_id: str) -> tuple[str, int]:
         if variant_agent_id == agent_id and variant_prompt is not None:
-            return variant_prompt, -1
+            return variant_prompt, variant_prompt_version or -1
         pv = get_active_prompt(agent_id)
         return pv.prompt_text, pv.version
 
-    transcripts_per_stage: list[tuple[str, list[dict]]] = []
+    stages: list[PipelineStageRun] = []
 
     # --- stage 1 ---
     p1_text, p1_ver = _prompt_for("agent_1")
@@ -345,14 +363,20 @@ def _run_full_pipeline_inline(
         workflow_id=f"sys-{label}-{iteration_id}-{profile.id[:8]}-1",
         iteration_id=iteration_id, persona=profile.persona,
     )
-    transcripts_per_stage.append(("agent_1", res1.transcript))
+    stages.append(PipelineStageRun(
+        agent_id="agent_1",
+        conversation_id=conv1,
+        outcome=res1.outcome,
+        transcript=res1.transcript,
+        tool_calls=res1.tool_calls,
+    ))
     if res1.outcome in ("opt_out", "no_response", "identity_unverified"):
-        return transcripts_per_stage
+        return stages
 
     # --- handoff 1 → 2 ---
     turns1 = _aggregate_tool_calls_from_turns(conv1)[0]
     h2 = summarize_for_handoff(
-        [{"role": t["role"], "content": t["content"], "agent_id": "agent_1"} for t in turns1],
+        turns1,
         to_agent="to_agent_2",
         conversation_id=str(conv1),
         iteration_id=iteration_id,
@@ -367,14 +391,20 @@ def _run_full_pipeline_inline(
         workflow_id=f"sys-{label}-{iteration_id}-{profile.id[:8]}-2",
         iteration_id=iteration_id, persona=profile.persona,
     )
-    transcripts_per_stage.append(("agent_2", res2.transcript))
+    stages.append(PipelineStageRun(
+        agent_id="agent_2",
+        conversation_id=conv2,
+        outcome=res2.outcome,
+        transcript=res2.transcript,
+        tool_calls=res2.tool_calls,
+    ))
     if res2.outcome in ("deal_agreed", "opt_out"):
-        return transcripts_per_stage
+        return stages
 
     # --- handoff 2 → 3 ---
     turns_combined = _aggregate_tool_calls_from_turns(conv1)[0] + _aggregate_tool_calls_from_turns(conv2)[0]
     h3 = summarize_for_handoff(
-        [{"role": t["role"], "content": t["content"], "agent_id": "borrower"} for t in turns_combined],
+        turns_combined,
         to_agent="to_agent_3",
         conversation_id=str(conv2),
         iteration_id=iteration_id,
@@ -389,8 +419,14 @@ def _run_full_pipeline_inline(
         workflow_id=f"sys-{label}-{iteration_id}-{profile.id[:8]}-3",
         iteration_id=iteration_id, persona=profile.persona,
     )
-    transcripts_per_stage.append(("agent_3", res3.transcript))
-    return transcripts_per_stage
+    stages.append(PipelineStageRun(
+        agent_id="agent_3",
+        conversation_id=conv3,
+        outcome=res3.outcome,
+        transcript=res3.transcript,
+        tool_calls=res3.tool_calls,
+    ))
+    return stages
 
 
 def _system_level_check(
@@ -418,7 +454,11 @@ def _system_level_check(
                 profile, variant_agent_id=None, variant_prompt=None,
                 iteration_id=iteration_id, client=client, label="sys-baseline",
             )
-            br = judge_full_pipeline(bt, client=client, iteration_id=iteration_id)
+            br = judge_full_pipeline(
+                [(s.agent_id, s.transcript) for s in bt],
+                client=client,
+                iteration_id=iteration_id,
+            )
             if br and "handoff_seamlessness" in br:
                 baseline_scores.append(float(br["handoff_seamlessness"]))
         except Exception as e:
@@ -430,7 +470,11 @@ def _system_level_check(
                 profile, variant_agent_id=agent_id, variant_prompt=variant_prompt,
                 iteration_id=iteration_id, client=client, label="sys-variant",
             )
-            vr = judge_full_pipeline(vt, client=client, iteration_id=iteration_id)
+            vr = judge_full_pipeline(
+                [(s.agent_id, s.transcript) for s in vt],
+                client=client,
+                iteration_id=iteration_id,
+            )
             if vr and "handoff_seamlessness" in vr:
                 variant_scores.append(float(vr["handoff_seamlessness"]))
         except Exception as e:
@@ -485,6 +529,84 @@ def _evaluate_prompt(
         scores.add(cs, system_value)
         log.info("  %s/%-15s persona=%-12s primary=%.3f compliance=%.2f outcome=%s",
                  label, str(profile.id)[:8], profile.persona, primary, compliance_rate, result.outcome)
+    return scores
+
+
+def _evaluate_prompt_full_pipeline(
+    agent_id: str,
+    prompt_text: str,
+    prompt_version: int,
+    borrowers: list[BorrowerProfile],
+    iteration_id: int,
+    client: Optional[AnthropicClient] = None,
+    label: str = "baseline",
+) -> AgentScores:
+    """Run full A1→A2→A3 pipelines and score the requested agent's stage.
+
+    Unlike ``_evaluate_prompt`` this does not use stub handoffs for Agent 2/3.
+    The candidate agent is evaluated in its real upstream/downstream context:
+      - agent_1 candidate: A1 candidate → real summary → active A2 → active A3
+      - agent_2 candidate: active A1 → real summary → A2 candidate → active A3
+      - agent_3 candidate: active A1 → real summary → active A2 → real summary → A3 candidate
+    """
+    client = client or AnthropicClient()
+    scores = AgentScores()
+
+    for i, profile in enumerate(borrowers):
+        stages = _run_full_pipeline_inline(
+            profile,
+            variant_agent_id=agent_id,
+            variant_prompt=prompt_text,
+            variant_prompt_version=prompt_version,
+            iteration_id=iteration_id,
+            client=client,
+            label=f"{label}-{i}",
+        )
+        target = next((s for s in stages if s.agent_id == agent_id), None)
+        if target is None:
+            # Upstream stage short-circuited. Keep the paired sample, but score the
+            # target as a miss because the full borrower journey never reached it.
+            transcript: list[dict] = []
+            tool_calls: list[dict] = []
+            conv_id = str(stages[-1].conversation_id if stages else uuid.uuid4())
+            outcome = "upstream_short_circuit"
+        else:
+            transcript = target.transcript
+            tool_calls = target.tool_calls
+            conv_id = str(target.conversation_id)
+            outcome = target.outcome
+
+        primary, outcome_metrics = primary_metric(agent_id, transcript, tool_calls)
+        compliance_dict = cheap_compliance(transcript, tool_calls)
+        compliance_rate = sum(compliance_dict.values()) / len(compliance_dict)
+        # System metric is about the whole journey, not only the target stage.
+        last_outcome = stages[-1].outcome if stages else "no_response"
+        system_value = 0.0 if last_outcome in ("no_response", "upstream_short_circuit") else 1.0
+        scores.add(
+            ConvScores(
+                conversation_id=conv_id,
+                persona=profile.persona,
+                agent_id=agent_id,
+                primary=primary,
+                outcome_metrics=outcome_metrics,
+                compliance=compliance_dict,
+                compliance_pass_rate=compliance_rate,
+            ),
+            system_value,
+        )
+        log.info(
+            "  %s/%-15s persona=%-12s primary=%.3f compliance=%.2f "
+            "target_outcome=%s pipeline_last=%s stages=%s",
+            label,
+            profile.id[:8],
+            profile.persona,
+            primary,
+            compliance_rate,
+            outcome,
+            last_outcome,
+            "→".join(s.agent_id for s in stages),
+        )
+
     return scores
 
 
@@ -547,8 +669,6 @@ def _compliance_preflight(
     # We swap the active prompt to the candidate, run probes that target this agent,
     # then revert. The DB constraint requires a real PromptVersion row, so write
     # the candidate first with status='candidate' and switch the pointer.
-    from sqlalchemy import select
-
     from packages.storage.db import session_scope
     from packages.storage.models import ActivePrompt, PromptVersion
 
@@ -560,7 +680,8 @@ def _compliance_preflight(
             prompt_tokens=count_tokens(new_prompt),
             status="candidate_preflight",
         )
-        s.add(cand); s.flush()
+        s.add(cand)
+        s.flush()
         cand_id = cand.id
         prev_active = s.get(ActivePrompt, agent_id).version_id
         s.get(ActivePrompt, agent_id).version_id = cand_id
@@ -579,35 +700,51 @@ def run_iteration(
     iteration_id: int,
     n_borrowers: int = 15,
     n_variants: int = 2,
+    eval_mode: str = "full",
     client: Optional[AnthropicClient] = None,
 ) -> IterationResult:
     client = client or AnthropicClient()
-    log.info("\n%s  ITERATION %d  agent=%s  N=%d  %s", "=" * 12, iteration_id, agent_id, n_borrowers, "=" * 12)
+    if eval_mode not in ("full", "isolated"):
+        raise ValueError(f"unknown eval_mode={eval_mode!r}; expected 'full' or 'isolated'")
+    log.info("\n%s  ITERATION %d  agent=%s  N=%d  eval_mode=%s  %s",
+             "=" * 12, iteration_id, agent_id, n_borrowers, eval_mode, "=" * 12)
 
     active = get_active_prompt(agent_id)
     log.info("baseline: prompt v%d (%d tokens), targeting %d borrowers",
              active.version, active.prompt_tokens, n_borrowers)
 
-    # ---- baseline: try DB reuse first, fall back to fresh run ----
-    # When we reuse, the variant MUST run on the exact same borrowers (paired bootstrap).
-    reuse = _load_baseline_from_db(
-        agent_id=agent_id,
-        active_version=active.version,
-        n_target=n_borrowers,
-        current_iteration_id=iteration_id,
-    )
-    if reuse is not None:
-        baseline, borrowers = reuse
-        log.info("baseline: REUSED %d stored conversations for agent_%s v%d "
-                 "(no fresh LLM calls; variant will be paired on same borrowers)",
-                 len(baseline.convs), agent_id[-1], active.version)
-    else:
+    # ---- baseline ----
+    # Full mode deliberately does NOT reuse stored isolated conversations because
+    # the whole point is to test each prompt inside the real A1→A2→A3 path.
+    if eval_mode == "full":
         borrowers = _pick_borrowers(n_borrowers)
-        log.info("baseline: no reusable stored data — running %d fresh conversations", n_borrowers)
-        baseline = _evaluate_prompt(
+        log.info("baseline: running %d fresh FULL PIPELINES", n_borrowers)
+        baseline = _evaluate_prompt_full_pipeline(
             agent_id, active.prompt_text, active.version,
-            borrowers, iteration_id, client, label="baseline",
+            borrowers, iteration_id, client, label="baseline-full",
         )
+    else:
+        # Cheap fallback: try DB reuse first, fall back to fresh isolated run.
+        # When we reuse, the variant MUST run on the exact same borrowers.
+        reuse = _load_baseline_from_db(
+            agent_id=agent_id,
+            active_version=active.version,
+            n_target=n_borrowers,
+            current_iteration_id=iteration_id,
+        )
+        if reuse is not None:
+            baseline, borrowers = reuse
+            log.info("baseline: REUSED %d stored conversations for agent_%s v%d "
+                     "(isolated mode; no fresh LLM calls)",
+                     len(baseline.convs), agent_id[-1], active.version)
+        else:
+            borrowers = _pick_borrowers(n_borrowers)
+            log.info("baseline: no reusable stored data — running %d isolated conversations",
+                     n_borrowers)
+            baseline = _evaluate_prompt(
+                agent_id, active.prompt_text, active.version,
+                borrowers, iteration_id, client, label="baseline",
+            )
     p_mean = sum(baseline.primary) / len(baseline.primary)
     c_mean = sum(baseline.compliance) / len(baseline.compliance)
     log.info("baseline: primary_mean=%.3f compliance_mean=%.3f", p_mean, c_mean)
@@ -617,6 +754,7 @@ def run_iteration(
     iteration = IterationResult(
         iteration_id=iteration_id,
         agent_id=agent_id,
+        eval_mode=eval_mode,
         baseline_prompt_version=active.version,
         baseline_prompt_tokens=active.prompt_tokens,
         baseline_primary_mean=p_mean,
@@ -659,10 +797,16 @@ def run_iteration(
             continue
 
         # paired eval
-        vscores = _evaluate_prompt(
-            agent_id, prop.prompt_text, -1,
-            borrowers, iteration_id, client, label=f"variant{idx}",
-        )
+        if eval_mode == "full":
+            vscores = _evaluate_prompt_full_pipeline(
+                agent_id, prop.prompt_text, -1,
+                borrowers, iteration_id, client, label=f"variant{idx}-full",
+            )
+        else:
+            vscores = _evaluate_prompt(
+                agent_id, prop.prompt_text, -1,
+                borrowers, iteration_id, client, label=f"variant{idx}",
+            )
         v.scores = vscores
         gate = evaluate_gate(
             baseline_primary=baseline.primary,
@@ -683,8 +827,10 @@ def run_iteration(
             v.gate_decision, v.primary_diff, v.cohens_d, v.ci_lower, v.ci_upper,
         )
 
-        # ---- system-level check (only if per-agent gate passes AND agent has downstream) ----
-        if gate.decision == GateDecision.ADOPT and agent_id in ("agent_1", "agent_2"):
+        # ---- system-level check (only needed for cheap isolated mode) ----
+        # Full mode has already run every paired sample through A1→A2→A3.
+        if eval_mode == "isolated" and gate.decision == GateDecision.ADOPT \
+                and agent_id in ("agent_1", "agent_2"):
             log.info("    running system-level check: %d full pipelines × 2 (baseline + variant) …", 3)
             sys_baseline, sys_variant = _system_level_check(
                 agent_id=agent_id,
@@ -730,6 +876,7 @@ def run_iteration(
                 parent_version=active.id,
                 adoption_data={
                     "iteration_id": iteration_id,
+                    "eval_mode": eval_mode,
                     "primary_diff": gate.primary_diff,
                     "cohens_d": gate.cohens_d,
                     "ci_lower": gate.bootstrap.ci_lower,
@@ -756,12 +903,15 @@ def run_iteration(
                 parent_version=active.id,
                 adoption_data={
                     "iteration_id": iteration_id,
+                    "eval_mode": eval_mode,
                     "gate_decision": v.gate_decision,
                     "gate_reasons": v.gate_reasons,
                     "primary_diff": gate.primary_diff,
                     "cohens_d": gate.cohens_d,
                     "ci_lower": gate.bootstrap.ci_lower,
                     "ci_upper": gate.bootstrap.ci_upper,
+                    "seamlessness_baseline": v.seamlessness_baseline,
+                    "seamlessness_variant": v.seamlessness_variant,
                 },
             )
             log.info("    REJECTED: %s", v.gate_reasons)
@@ -805,6 +955,7 @@ def _write_iteration_csv(iteration: IterationResult, baseline: AgentScores) -> N
         {
             "iteration_id": iteration.iteration_id,
             "agent_id": iteration.agent_id,
+            "eval_mode": iteration.eval_mode,
             "baseline_prompt_version": iteration.baseline_prompt_version,
             "baseline_primary_mean": iteration.baseline_primary_mean,
             "baseline_compliance_rate": iteration.baseline_compliance_rate,
@@ -824,6 +975,9 @@ def _write_iteration_csv(iteration: IterationResult, baseline: AgentScores) -> N
                     "cohens_d": v.cohens_d,
                     "ci_lower": v.ci_lower,
                     "ci_upper": v.ci_upper,
+                    "system_check_ran": v.system_check_ran,
+                    "seamlessness_baseline": v.seamlessness_baseline,
+                    "seamlessness_variant": v.seamlessness_variant,
                 }
                 for v in iteration.variants
             ],
