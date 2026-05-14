@@ -11,6 +11,7 @@ from temporalio import activity
 from packages.agents.agent_1 import AssessmentAgent
 from packages.agents.agent_2 import ResolutionAgent
 from packages.agents.agent_3 import FinalNoticeAgent
+from packages.config import settings
 from packages.simulator.borrower import BorrowerSimulator, load_borrowers
 from packages.simulator.runner import run_chat_conversation
 from packages.storage.repos import (
@@ -73,6 +74,12 @@ async def run_chat_agent(inp: ChatAgentInput) -> ChatAgentOutput:
         raise RuntimeError(f"borrower {inp.borrower_id} not found in seeds")
     profile = candidates[0]
 
+    # VOICE_MODE branch: Agent 2 can run over a real Vapi call. The workflow stays
+    # the same shape; we just dispatch to the voice activity instead. The text-mode
+    # path remains the default + the only one used by the learning loop.
+    if inp.agent_id == "agent_2" and settings().voice_mode == "vapi":
+        return await _run_agent_2_via_vapi(inp, profile)
+
     agent = agent_cls()
     sim = BorrowerSimulator(profile)
     conv_id, result = run_chat_conversation(
@@ -88,6 +95,48 @@ async def run_chat_agent(inp: ChatAgentInput) -> ChatAgentOutput:
         outcome=result.outcome,
         turns=result.turns,
         transcript=result.transcript,
+    )
+
+
+async def _run_agent_2_via_vapi(
+    inp: ChatAgentInput, profile
+) -> ChatAgentOutput:
+    """Place an outbound Vapi call. Returns once the call has been initiated;
+    the final transcript arrives later via /voice/callback (see apps/voice/webhook.py).
+
+    For the Day 5 demo we don't block the workflow on call-end — the audio
+    recording is the deliverable. A signal-driven version that blocks until the
+    webhook fires is straightforward to add (see decision-journal notes).
+    """
+    from apps.voice.client import VapiClient
+
+    if not profile.phone:
+        raise RuntimeError(f"borrower {profile.id} has no phone number on file")
+
+    client = VapiClient()
+    result = client.start_outbound_call(
+        to_number=profile.phone,
+        handoff_json=inp.handoff,
+        borrower_name=profile.name,
+    )
+    # Stub a placeholder conversation row so downstream activities have something
+    # to reference. The webhook will overwrite this with the real transcript.
+    import uuid as _uuid
+    from packages.storage.repos import create_conversation
+    conv_id = create_conversation(
+        borrower_id=_uuid.UUID(profile.id),
+        workflow_id=activity.info().workflow_id,
+        persona=f"vapi_{profile.persona}",
+        agent_versions={"agent_2": 1},
+    )
+    return ChatAgentOutput(
+        conversation_id=str(conv_id),
+        outcome="vapi_initiated",
+        turns=0,
+        transcript=[{
+            "role": "system",
+            "content": f"[Vapi call placed: call_id={result.call_id} status={result.status}]",
+        }],
     )
 
 

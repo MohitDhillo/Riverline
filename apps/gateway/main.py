@@ -12,10 +12,12 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from temporalio.client import Client
 
+from apps.voice.webhook import router as voice_router
 from apps.workflow.collections import CollectionsInput, CollectionsWorkflow
 from packages.config import settings
 
 app = FastAPI(title="Riverline Collections Gateway")
+app.include_router(voice_router)
 _client: Client | None = None
 
 

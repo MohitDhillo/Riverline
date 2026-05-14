@@ -32,8 +32,7 @@ class Outcome(str, Enum):
 class CollectionsInput:
     borrower_id: str
     iteration_id: Optional[int] = None
-    # If true, stop after Agent 1 (D1-style). Useful for unit testing in workflow form.
-    assess_only: bool = False
+    max_assessment_attempts: int = 3   # spec: retry up to 3 times on no_response
 
 
 @dataclass
@@ -44,6 +43,8 @@ class CollectionsOutput:
     final_conversation_id: Optional[str] = None
     handoff_1_to_2_tokens: int = 0
     handoff_2_to_3_tokens: int = 0
+    assessment_attempts: int = 1
+    assessment_exhausted: bool = False
     summary: str = ""
     excerpts: dict = field(default_factory=dict)
 
@@ -58,28 +59,37 @@ class CollectionsWorkflow:
     async def run(self, inp: CollectionsInput) -> CollectionsOutput:
         out = CollectionsOutput(outcome=Outcome.UNRESOLVED)
 
-        # ---- ASSESSMENT ----
-        # Day 2: single attempt. 3-retry loop comes later when we add signal-driven chat.
-        t1: ChatAgentOutput = await workflow.execute_activity(
-            run_chat_agent,
-            ChatAgentInput(
-                borrower_id=inp.borrower_id,
-                agent_id="agent_1",
-                handoff="",
-                iteration_id=inp.iteration_id,
-                max_turns=12,
-            ),
-            start_to_close_timeout=timedelta(minutes=10),
-            heartbeat_timeout=timedelta(minutes=2),
-            retry_policy=RetryPolicy(maximum_attempts=1),
-        )
+        # ---- ASSESSMENT (spec: retry up to 3 attempts on no_response) ----
+        t1: Optional[ChatAgentOutput] = None
+        for attempt in range(1, inp.max_assessment_attempts + 1):
+            t1 = await workflow.execute_activity(
+                run_chat_agent,
+                ChatAgentInput(
+                    borrower_id=inp.borrower_id,
+                    agent_id="agent_1",
+                    handoff="",
+                    iteration_id=inp.iteration_id,
+                    max_turns=12,
+                ),
+                start_to_close_timeout=timedelta(minutes=10),
+                heartbeat_timeout=timedelta(minutes=2),
+                retry_policy=RetryPolicy(maximum_attempts=1),
+            )
+            out.assessment_attempts = attempt
+            if t1.outcome in ("assessed", "partial", "opt_out"):
+                break
+            # else: outcome was 'no_response' — retry until exhausted
+        # If all retries exhausted with still no_response, spec says "proceed to
+        # Resolution anyway" (the diamond's 'exhausted' edge leads to Resolution).
+        if t1 is None:
+            raise RuntimeError("assessment loop produced no result")
+        if t1.outcome == "no_response":
+            out.assessment_exhausted = True
+
         out.assessment_conversation_id = t1.conversation_id
         out.excerpts["agent_1"] = _excerpt(t1.transcript)
         if t1.outcome == "opt_out":
             out.outcome = Outcome.OPT_OUT
-            return out
-        if inp.assess_only:
-            out.summary = f"assess_only=True; outcome={t1.outcome}"
             return out
 
         # ---- Handoff 1→2 ----
