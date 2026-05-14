@@ -1,4 +1,4 @@
-.PHONY: fresh-start up down seed test smoke chat chat-sim worker api logs clean costs
+.PHONY: fresh-start up down seed test smoke chat chat-sim vapi-call rerun-eval meta-eval worker api logs clean costs
 
 # Boot everything from cold (target: <5 min, FINAL_PLAN §13)
 fresh-start: up seed test
@@ -26,11 +26,20 @@ smoke:
 #   make chat                    -> cooperative profile
 #   make chat PERSONA=distressed -> distressed profile (tests hardship rule)
 chat:
-	uv run python scripts/chat.py --mode human --persona $(or $(PERSONA),cooperative)
+	uv run python scripts/chat.py --mode human $(if $(PERSONA),--persona $(PERSONA),)
 
 # Autoplay: LLM-borrower against the agents (visible alternative to make smoke).
 chat-sim:
-	uv run python scripts/chat.py --mode sim --persona $(or $(PERSONA),cooperative)
+	uv run python scripts/chat.py --mode sim $(if $(PERSONA),--persona $(PERSONA),)
+
+vapi-call:
+	uv run python scripts/vapi_call.py $(if $(PERSONA),--persona $(PERSONA),) $(if $(TO),--to $(TO),)
+
+rerun-eval:
+	uv run python scripts/run_learning_loop.py --agent $(or $(AGENT),agent_1) --iters $(or $(ITERS),2) --n $(or $(N),15) --variants $(or $(VARIANTS),2)
+
+meta-eval:
+	uv run python scripts/run_meta_eval.py $(if $(ITERATION),--iteration $(ITERATION),)
 
 worker:
 	uv run python -m apps.workflow.worker

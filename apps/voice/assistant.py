@@ -51,7 +51,12 @@ def build_assistant_config(
         "model": {
             "provider": "anthropic",
             "model": model,
-            "systemPrompt": system_prompt,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": system_prompt,
+                }
+            ],
             "temperature": 0.3,
         },
         "voice": {"provider": "vapi", "voiceId": voice},
@@ -60,6 +65,7 @@ def build_assistant_config(
         "endCallPhrases": ["goodbye", "thank you for your time", "stop calling me"],
         "maxDurationSeconds": 600,
         "recordingEnabled": True,
+        "serverMessages": ["status-update", "end-of-call-report"],
         "metadata": {
             "agent_id": "agent_2",
             "prompt_version": pv.version,

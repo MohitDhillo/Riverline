@@ -1,7 +1,7 @@
 """Thin Vapi REST client.
 
 Vapi outbound-call flow:
-  1. POST /call/phone with our assistant overrides + the destination number
+  1. POST /call with our transient assistant + the destination number
   2. Vapi places the call and runs Agent 2 as the assistant
   3. On call end, Vapi POSTs a 'end-of-call-report' webhook to our public URL
      with the transcript, recordingUrl, and structured tool calls.
@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Optional
+from urllib.parse import urlparse
 
 import httpx
 
@@ -23,6 +24,17 @@ from apps.voice.assistant import build_assistant_config
 from packages.config import settings
 
 VAPI_BASE = "https://api.vapi.ai"
+
+
+def _callback_url(url: str) -> str:
+    """Accept either a base tunnel URL or the full callback route."""
+    cleaned = url.rstrip("/")
+    if not cleaned:
+        return cleaned
+    parsed = urlparse(cleaned)
+    if parsed.path and parsed.path != "/":
+        return cleaned
+    return f"{cleaned}/voice/callback"
 
 
 @dataclass
@@ -69,10 +81,11 @@ class VapiClient:
             "customer": {"number": to_number},
             "assistant": assistant,
         }
-        if webhook_url or settings().public_webhook_url:
-            body["assistant"]["serverUrl"] = webhook_url or settings().public_webhook_url
+        callback = _callback_url(webhook_url or settings().public_webhook_url)
+        if callback:
+            body["assistant"]["serverUrl"] = callback
         with httpx.Client(timeout=30.0) as c:
-            r = c.post(f"{VAPI_BASE}/call/phone", headers=self._headers(), json=body)
+            r = c.post(f"{VAPI_BASE}/call", headers=self._headers(), json=body)
             r.raise_for_status()
             data = r.json()
         return VapiCallResult(
