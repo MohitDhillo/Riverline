@@ -1,5 +1,15 @@
 .env
 .env.local
+# local-only scratch (intentionally not committed)
+journal-scratchpad.txt
+AUDIT.md
+DEMO_SCRIPT.md
+DECISION_JOURNAL_PROMPTS.md
+PLAN.md
+FINAL_PLAN.md
+sonnet.md
+docs/
+*.tmp
 __pycache__/
 *.pyc
 *.pyo
