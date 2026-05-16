@@ -1,4 +1,4 @@
-.PHONY: fresh-start up down seed test smoke chat chat-sim vapi-call rerun-eval meta-eval lift-prompts report worker api logs clean costs
+.PHONY: fresh-start up down seed test smoke chat chat-sim vapi-call rerun-eval rerun-eval-rotate meta-eval lift-prompts report worker api logs clean costs
 
 # Boot everything from cold (target: <5 min, FINAL_PLAN §13)
 fresh-start: up seed test
@@ -36,7 +36,13 @@ vapi-call:
 	uv run python scripts/vapi_call.py $(if $(PERSONA),--persona $(PERSONA),) $(if $(TO),--to $(TO),)
 
 rerun-eval:
-	uv run python scripts/run_learning_loop.py --agent $(or $(AGENT),agent_1) --iters $(or $(ITERS),2) --n $(or $(N),15) --variants $(or $(VARIANTS),2) --eval-mode $(or $(EVAL_MODE),full)
+	uv run python scripts/run_learning_loop.py --agent $(or $(AGENT),agent_1) --iters $(or $(ITERS),2) --n $(or $(N),15) --variants $(or $(VARIANTS),2)
+
+# Rotate through all three agents per cycle, so every agent gets a chance to evolve.
+#   make rerun-eval-rotate                       # 1 cycle: agent_1 → agent_2 → agent_3
+#   make rerun-eval-rotate CYCLES=2 N=12         # 2 cycles, N=12 per iteration
+rerun-eval-rotate:
+	uv run python scripts/run_learning_loop.py --agents agent_1,agent_2,agent_3 --iters $(or $(CYCLES),1) --n $(or $(N),12) --variants $(or $(VARIANTS),2) --eval-mode $(or $(EVAL_MODE),full)
 
 meta-eval:
 	uv run python scripts/run_meta_eval.py $(if $(ITERATION),--iteration $(ITERATION),)
