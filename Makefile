@@ -35,14 +35,15 @@ chat-sim:
 vapi-call:
 	uv run python scripts/vapi_call.py $(if $(PERSONA),--persona $(PERSONA),) $(if $(TO),--to $(TO),)
 
+# Single-agent: 1 iteration, N=10 borrowers, 1 variant. Fast+cheap (~$1).
+# Override: make rerun-eval AGENT=agent_2 N=15 VARIANTS=2
 rerun-eval:
-	uv run python scripts/run_learning_loop.py --agent $(or $(AGENT),agent_1) --iters $(or $(ITERS),2) --n $(or $(N),15) --variants $(or $(VARIANTS),2)
+	uv run python scripts/run_learning_loop.py --agent $(or $(AGENT),agent_1) --iters 1 --n $(or $(N),10) --variants $(or $(VARIANTS),1)
 
-# Rotate through all three agents per cycle, so every agent gets a chance to evolve.
-#   make rerun-eval-rotate                       # 1 cycle: agent_1 → agent_2 → agent_3
-#   make rerun-eval-rotate CYCLES=2 N=12         # 2 cycles, N=12 per iteration
+# Rotate all three agents in one cycle: agent_1 → agent_2 → agent_3. (~$3 total).
+# Override: make rerun-eval-rotate CYCLES=2 N=12 VARIANTS=2
 rerun-eval-rotate:
-	uv run python scripts/run_learning_loop.py --agents agent_1,agent_2,agent_3 --iters $(or $(CYCLES),1) --n $(or $(N),12) --variants $(or $(VARIANTS),2) --eval-mode $(or $(EVAL_MODE),full)
+	uv run python scripts/run_learning_loop.py --agents agent_1,agent_2,agent_3 --iters $(or $(CYCLES),1) --n $(or $(N),10) --variants $(or $(VARIANTS),1) --eval-mode $(or $(EVAL_MODE),full)
 
 meta-eval:
 	uv run python scripts/run_meta_eval.py $(if $(ITERATION),--iteration $(ITERATION),)
