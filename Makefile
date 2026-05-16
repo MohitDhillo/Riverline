@@ -1,4 +1,4 @@
-.PHONY: fresh-start up down seed test smoke chat chat-sim vapi-call rerun-eval meta-eval lift-prompts worker api logs clean costs
+.PHONY: fresh-start up down seed test smoke chat chat-sim vapi-call rerun-eval meta-eval lift-prompts report worker api logs clean costs
 
 # Boot everything from cold (target: <5 min, FINAL_PLAN §13)
 fresh-start: up seed test
@@ -44,6 +44,10 @@ meta-eval:
 # Write currently-active prompts back to disk so adoptions are visible in the repo.
 lift-prompts:
 	uv run python scripts/lift_active_prompts.py
+
+# Build the consolidated EVOLUTION_REPORT.md (pure DB + CSV aggregation, no LLM).
+report:
+	uv run python scripts/build_evolution_report.py
 
 worker:
 	uv run python -m apps.workflow.worker
